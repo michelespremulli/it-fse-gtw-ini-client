@@ -28,6 +28,7 @@ import javax.xml.transform.dom.DOMSource;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -42,6 +43,7 @@ import org.w3c.dom.Element;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
@@ -50,11 +52,11 @@ import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
 import it.finanze.sanita.fse2.ms.iniclient.service.ISecuritySRV;
 import it.finanze.sanita.fse2.ms.iniclient.service.impl.Iti42SoapForge;
 
-/** Internal publication endpoint; never uses workflow or mock orchestration. */
+/** Internal ITI-42 endpoint; never uses workflow or mock orchestration. */
 @RestController
 @ConditionalOnProperty(name = "ini.guided.enabled", havingValue = "true")
 @RequestMapping("/internal/iti-42")
-@Tag(name = "Pubblicazione guidata ITI-42", description = "Costruzione SOAP interna, senza JWT o orchestrazione del workflow.")
+@Tag(name = "Operazioni guidate ITI-42", description = "CREATE, REPLACE e UPDATE v1, senza JWT o orchestrazione del workflow.")
 public class Iti42GuidedInjector {
 
     private static final int MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -69,12 +71,17 @@ public class Iti42GuidedInjector {
         this.govway = govway;
     }
 
-    @PostMapping(value = "/guided", consumes = "application/json", produces = "application/json")
-    @Operation(summary = "Costruisce una pubblicazione SOAP ITI-42 con asserzione SAML firmata", description = """
-            Con dryRun=true restituisce l'XML senza inviarlo. Con dryRun=false invia gli stessi byte
+    @PostMapping(value = "/guided", consumes = "application/json")
+    @Operation(summary = "Costruisce SOAP ITI-42 CREATE, REPLACE o UPDATE v1 con SAML firmato", description = """
+            Con dryRun=true restituisce direttamente i byte XML (application/soap+xml), senza involucro JSON,
+            escape JSON o riformattazione. Con dryRun=false restituisce l'esito JSON e invia i byte SOAP
             alla destinazione configurata sul server. Gli ID tecnici e IssueInstant sono generati;
-            Il parametro query action accetta solo CREATE (predefinito).
-            L'action-id SAML è derivato internamente come CREATE; SubmissionSetStatus=Original è costante.
+            Il parametro query action accetta CREATE (predefinito), REPLACE o UPDATE.
+            Tutti usano RegisterDocumentSet-b e la destinazione registry v1, non ITI-57.
+            L'action-id SAML è CREATE per CREATE/REPLACE, UPDATE per UPDATE.
+            REPLACE richiede RPLC.targetObject; UPDATE richiede XDSDocumentEntry.lid.
+            UPDATE riceve tutti i metadati finali: non legge INI e non esegue merge o patch.
+            I campi specifici di un'altra operazione sono ignorati. SubmissionSetStatus=Original è costante.
             Il paziente è fornito una sola volta e riutilizzato in header e body.
             Autore clinico condiviso fra documento e sottomissione; ruolo e istituzione derivati dal contesto.
             SourceId e data sottomissione sono derivati; MIME fisso al valore del Dispatcher.
@@ -87,20 +94,33 @@ public class Iti42GuidedInjector {
             L'XML contiene dati sensibili e un'asserzione firmata.
             Ogni invocazione costruisce un nuovo SOAP completo: ripetere il JSON genera nuovi ID, tempi e firma.
             """)
-    @ApiResponse(responseCode = "200", description = "Anteprima SOAP oppure pubblicazione accettata dal registro INI.")
-    @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri action/dryRun non deserializzabili; action supporta solo CREATE.")
+    @ApiResponse(responseCode = "200", description = "dryRun=true: XML SOAP diretto; dryRun=false: esito JSON.",
+            content = {
+                    @Content(mediaType = "application/soap+xml", schema = @Schema(type = "string")),
+                    @Content(mediaType = "application/json", schema = @Schema(implementation = PublicationResponse.class))
+            })
+    @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri non validi; action supporta CREATE, REPLACE e UPDATE. "
+            + "Riferimento obbligatorio per REPLACE/UPDATE mancante.")
     @ApiResponse(responseCode = "500", description = "Costruzione o firma fallita; nessuna trasmissione eseguita.")
     @ApiResponse(responseCode = "502", description = "Errore di trasporto, SOAP Fault o rifiuto del registro. "
             + "Dopo un tentativo di trasmissione la consegna può essere incerta: non ripetere automaticamente.")
-    public ResponseEntity<PublicationResponse> publish(
+    public ResponseEntity<?> publish(
             @RequestBody GuidedPublicationRequest input,
-            @Parameter(description = "Operazione di costruzione SOAP: solo CREATE (pubblicazione), valore predefinito.")
-            @RequestParam(name = "action", defaultValue = "CREATE") GuidedAction action,
+            @Parameter(description = "Operazione ITI-42: CREATE (predefinito), REPLACE o UPDATE v1. Non è l'action-id SAML.",
+                    schema = @Schema(allowableValues = {"CREATE", "REPLACE", "UPDATE"}, defaultValue = "CREATE"))
+            @RequestParam(name = "action", defaultValue = "CREATE") String action,
             @Parameter(description = "true (predefinito): sola anteprima; false: invio HTTPS effettivo a INI.") @RequestParam(defaultValue = "true") boolean dryRun) {
         try {
-            ForgedIti42Request request = switch (action) {
-                case CREATE -> forge.forge(input);
-            };
+            if (!"CREATE".equals(action) && !"REPLACE".equals(action) && !"UPDATE".equals(action)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Supported ITI-42 actions: CREATE, REPLACE, UPDATE");
+            }
+            if ("REPLACE".equals(action) && (input.replacementTarget() == null || input.replacementTarget().isBlank())) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "REPLACE requires RPLC.targetObject");
+            }
+            if ("UPDATE".equals(action) && (input.documentLogicalId() == null || input.documentLogicalId().isBlank())) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "UPDATE requires XDSDocumentEntry.lid");
+            }
+            ForgedIti42Request request = forge.forge(input, action);
 
             // A future read-only Shield inspects request here, including the completed message.
             // Serialize that same instance once; do not rebuild or format XML after inspection.
@@ -109,9 +129,9 @@ public class Iti42GuidedInjector {
             byte[] soap = bytes.toByteArray();
 
             if (dryRun) {
-                return response(HttpStatus.OK, new PublicationResponse(true, false, "PREVIEW",
-                        request.destination().toString(), request.messageId(), request.assertionId(),
-                        new String(soap, StandardCharsets.UTF_8), null, null));
+                return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                        .contentType(MediaType.parseMediaType("application/soap+xml; charset=UTF-8"))
+                        .body(soap);
             }
 
             return send(request, soap);
@@ -210,12 +230,12 @@ public class Iti42GuidedInjector {
 
             return response(responseStatus, new PublicationResponse(false, true, outcome,
                     request.destination().toString(), request.messageId(), request.assertionId(),
-                    null, status, new String(bytes, StandardCharsets.UTF_8)));
+                    status, new String(bytes, StandardCharsets.UTF_8)));
         } catch (Exception exception) {
             return response(HttpStatus.BAD_GATEWAY, new PublicationResponse(false, transmissionStarted,
                     transmissionStarted ? "TRANSPORT_OR_RESPONSE_ERROR_DELIVERY_UNKNOWN" : "TRANSPORT_SETUP_ERROR",
                     request.destination().toString(), request.messageId(), request.assertionId(),
-                    null, null, null));
+                    null, null));
         } finally {
             if (connection != null) {
                 connection.disconnect();
@@ -224,7 +244,8 @@ public class Iti42GuidedInjector {
     }
 
     private ResponseEntity<PublicationResponse> response(HttpStatus status, PublicationResponse body) {
-        return ResponseEntity.status(status).cacheControl(CacheControl.noStore()).body(body);
+        return ResponseEntity.status(status).cacheControl(CacheControl.noStore())
+                .contentType(MediaType.APPLICATION_JSON).body(body);
     }
 
     @ExceptionHandler(ResponseStatusException.class)
@@ -232,11 +253,6 @@ public class Iti42GuidedInjector {
         var problem = ProblemDetail.forStatusAndDetail(
                 exception.getStatusCode(), exception.getReason() == null ? "Request rejected" : exception.getReason());
         return ResponseEntity.status(exception.getStatusCode()).cacheControl(CacheControl.noStore()).body(problem);
-    }
-
-    @Schema(description = "Operazioni supportate dall'endpoint guidato: esclusivamente pubblicazione CREATE.")
-    public enum GuidedAction {
-        CREATE
     }
 
     @Schema(description = "Risultato della costruzione o dell'invio. I campi null non sono inclusi nel JSON.")
@@ -247,7 +263,6 @@ public class Iti42GuidedInjector {
             @Schema(description = "Destinazione configurata sul server.") String destination,
             @Schema(description = "MessageID WS-Addressing generato per questa costruzione.") String messageId,
             @Schema(description = "ID SAML generato per questa asserzione.") String assertionId,
-            @Schema(description = "XML SOAP firmato, restituito solo in anteprima. Contiene dati sensibili.") String soapXml,
             @Schema(description = "Stato HTTP restituito da INI, quando disponibile.") Integer upstreamHttpStatus,
             @Schema(description = "XML della risposta INI, quando disponibile. Può contenere dati sensibili.") String upstreamSoapXml) {
     }
