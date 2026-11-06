@@ -22,6 +22,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Date;
 import java.util.List;
 import java.util.UUID;
 
@@ -77,11 +78,15 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
+import it.finanze.sanita.fse2.ms.iniclient.client.IIniClient;
+import it.finanze.sanita.fse2.ms.iniclient.dto.JWTPayloadDTO;
+import it.finanze.sanita.fse2.ms.iniclient.dto.JWTTokenDTO;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.ForgedIti42Request;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
 import it.finanze.sanita.fse2.ms.iniclient.enums.ClassificationEnum;
+import it.finanze.sanita.fse2.ms.iniclient.enums.ActionEnumType;
+import it.finanze.sanita.fse2.ms.iniclient.enums.SearchTypeEnum;
 import it.finanze.sanita.fse2.ms.iniclient.utility.FileUtility;
-import it.finanze.sanita.fse2.ms.iniclient.utility.StringUtility;
 import oasis.names.tc.ebxml_regrep.xsd.lcm._3.SubmitObjectsRequest;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.AssociationType1;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.ClassificationType;
@@ -95,7 +100,6 @@ import oasis.names.tc.ebxml_regrep.xsd.rim._3.RegistryObjectType;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.RegistryPackageType;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.SlotType1;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.ValueListType;
-import oasis.names.tc.ebxml_regrep.xsd.rim._3.VersionInfoType;
 
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.CLASSIFICATION_OBJECT_URN;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.EXTERNAL_IDENTIFIER_URN;
@@ -106,9 +110,8 @@ import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientCons
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.SUBJECT_AUTHENTICATOR;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.LANGUAGE_CODE;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.DOCUMENT_SIGNED;
-import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.SOURCE_ID_PREFIX;
 
-/** ITI-42 CREATE, REPLACE and v1 UPDATE construction, without transport or JWT interpretation. */
+/** ITI-42 construction with preliminary UPDATE metadata lookup, without JWT interpretation. */
 @Component
 @ConditionalOnProperty(name = "ini.guided.enabled", havingValue = "true")
 public class Iti42SoapForge {
@@ -121,14 +124,16 @@ public class Iti42SoapForge {
     private static final DateTimeFormatter SUBMISSION_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
 
     private final IniCFG config;
+    private final IIniClient iniClient;
     private final String keyStoreType;
     private final ObjectFactory objects = new ObjectFactory();
     private final BasicX509Credential credential;
     private final JAXBContext binding;
 
-    public Iti42SoapForge(IniCFG config,
+    public Iti42SoapForge(IniCFG config, IIniClient iniClient,
             @Value("${ini.guided.signing-store-type:PKCS12}") String keyStoreType) {
         this.config = config;
+        this.iniClient = iniClient;
         this.keyStoreType = keyStoreType;
 
         try {
@@ -151,8 +156,6 @@ public class Iti42SoapForge {
             };
             if ("REPLACE".equals(operation)) {
                 required(input.replacementTarget(), "RPLC.targetObject");
-            } else if ("UPDATE".equals(operation)) {
-                required(input.documentLogicalId(), "XDSDocumentEntry.lid");
             }
             required(config.getUrlWsdlDocumentRegistryService(), "destination");
             URI destination = URI.create(config.getUrlWsdlDocumentRegistryService());
@@ -164,7 +167,8 @@ public class Iti42SoapForge {
             MessageID messageId = new MessageIDBuilder().buildObject();
             messageId.setValue(UUID.randomUUID().toString());
 
-            SubmitObjectsRequest body = buildBody(input, operation);
+            ExtrinsicObjectType existingDocument = "UPDATE".equals(operation) ? readUpdateDocument(input) : null;
+            SubmitObjectsRequest body = buildBody(input, operation, existingDocument);
             Assertion assertion = buildAssertion(input, samlAction);
 
             // Finish all assertion content before computing its signature.
@@ -279,7 +283,48 @@ public class Iti42SoapForge {
         statement.getAttributes().add(attribute);
     }
 
-    private SubmitObjectsRequest buildBody(GuidedPublicationRequest input, String operation) {
+    private ExtrinsicObjectType readUpdateDocument(GuidedPublicationRequest input) {
+        required(input.documentUniqueId(), "XDSDocumentEntry.uniqueId");
+        if (input.documentUniqueId().isBlank()) {
+            throw new IllegalArgumentException("UPDATE requires XDSDocumentEntry.uniqueId");
+        }
+
+        // Adapt the explicit context to the legacy read client; no JWT is accepted or decoded.
+        // The read client reconfigures this request-local payload to READ/UPDATE.
+        JWTPayloadDTO context = JWTPayloadDTO.builder()
+                .sub(input.subjectId())
+                .subject_role(input.role())
+                .subject_organization_id(input.organizationId())
+                .subject_organization(input.organization())
+                .locality(input.locality())
+                .person_id(input.patientId())
+                .patient_consent(input.patientConsent())
+                .resource_hl7_type(input.resourceHl7Type())
+                .subject_application_id(input.applicationId())
+                .subject_application_vendor(input.applicationVendor())
+                .subject_application_version(input.applicationVersion())
+                .build();
+        var response = iniClient.getReferenceMetadata(input.documentUniqueId(), SearchTypeEnum.LEAF_CLASS.getSearchKey(),
+                new JWTTokenDTO(context), ActionEnumType.READ_METADATA, UUID.randomUUID().toString(), new Date());
+
+        if (response == null || response.getRegistryObjectList() == null) {
+            throw new IllegalStateException("INI returned no document metadata for UPDATE");
+        }
+        List<ExtrinsicObjectType> approved = response.getRegistryObjectList().getIdentifiable().stream()
+                .map(entry -> entry.getValue())
+                .filter(ExtrinsicObjectType.class::isInstance)
+                .map(ExtrinsicObjectType.class::cast)
+                .filter(document -> "urn:oasis:names:tc:ebxml-regrep:StatusType:Approved".equals(document.getStatus()))
+                .toList();
+
+        if (approved.size() != 1) {
+            throw new IllegalStateException("UPDATE requires one Approved document from INI");
+        }
+        return approved.getFirst();
+    }
+
+    private SubmitObjectsRequest buildBody(GuidedPublicationRequest input, String operation,
+            ExtrinsicObjectType existingDocument) {
 
         RegistryObjectListType entries = new RegistryObjectListType();
 
@@ -292,12 +337,16 @@ public class Iti42SoapForge {
                 "urn:uuid:7edca82f-054d-47f2-a032-9b2a5b5186c1");
         if ("UPDATE".equals(operation)) {
             // Guided UPDATE receives the complete desired snapshot, not a patch to merge.
-            document.setLid(input.documentLogicalId());
-            if (input.documentVersion() != null) {
-                VersionInfoType version = new VersionInfoType();
-                version.setVersionName(input.documentVersion());
-                document.setVersionInfo(version);
+            String logicalId = existingDocument.getLid();
+            if (logicalId == null || logicalId.isEmpty()) {
+                logicalId = existingDocument.getId();
             }
+            required(logicalId, "INI document lid or id");
+            if (logicalId.isBlank()) {
+                throw new IllegalStateException("INI returned no usable document identifier for UPDATE");
+            }
+            document.setLid(logicalId);
+            document.setVersionInfo(existingDocument.getVersionInfo());
         }
         documentSlots(document, input);
         coded(document, ClassificationEnum.CLASS_CODE, documentInput.classCode());
@@ -315,8 +364,9 @@ public class Iti42SoapForge {
         coded(document, ClassificationEnum.PRACTICE_SETTING_CODE, documentInput.practiceSettingCode());
         coded(document, ClassificationEnum.TYPE_CODE, documentInput.typeCode());
 
-        author(document, ClassificationEnum.AUTHOR.getClassificationScheme(), input);
-        identifier(document, "XDSDocumentEntry.patientId", "urn:uuid:58a6f841-87b3-4a3e-92fd-a8ffeff98427", input.patientId());
+        author(document, ClassificationEnum.AUTHOR.getClassificationScheme(), input.authorPerson(),
+                input.documentAuthorRole(), input.documentAuthorInstitution());
+        identifier(document, "XDSDocumentEntry.patientId", "urn:uuid:58a6f841-87b3-4a3e-92fd-a8ffeff98427", input.documentPatientId());
         identifier(document, "XDSDocumentEntry.uniqueId", "urn:uuid:2e82c1f6-a085-4c72-9da3-8640a32e42ab", input.documentUniqueId());
         entries.getIdentifiable().add(objects.createExtrinsicObject(document));
 
@@ -328,12 +378,12 @@ public class Iti42SoapForge {
         addSlot(submission, "submissionTime", SUBMISSION_TIME_FORMAT.format(Instant.now().atZone(ZoneId.systemDefault())));
         coded(submission, "urn:uuid:aa543740-bdda-424e-8c96-df4873be8500",
                 "2.16.840.1.113883.2.9.3.3.6.1.4", submissionInput.contentTypeCode(), "IdContentTypeCode");
-        author(submission, "urn:uuid:a7058bb9-b4e4-4307-ba5b-e3f0ab85e12d", input);
-        required(input.organizationId(), "urn:oasis:names:tc:xspa:1.0:subject:organization-id");
+        author(submission, "urn:uuid:a7058bb9-b4e4-4307-ba5b-e3f0ab85e12d", input.submissionAuthorPerson(),
+                input.submissionAuthorRole(), input.submissionAuthorInstitution());
         identifier(submission, "XDSSubmissionSet.sourceId", "urn:uuid:554ac39e-e3fe-47fe-b233-965d2a147832",
-                SOURCE_ID_PREFIX + StringUtility.sanitizeSourceId(input.organizationId()));
+                input.submissionSourceId());
         identifier(submission, "XDSSubmissionSet.uniqueId", "urn:uuid:96fdda7c-d067-4183-912e-bf5ee74998a8", input.submissionUniqueId());
-        identifier(submission, "XDSSubmissionSet.patientId", "urn:uuid:6b5aea1a-874d-4603-a4bc-96a0a7b38446", input.patientId());
+        identifier(submission, "XDSSubmissionSet.patientId", "urn:uuid:6b5aea1a-874d-4603-a4bc-96a0a7b38446", input.submissionPatientId());
         entries.getIdentifiable().add(objects.createRegistryPackage(submission));
 
         // The association links the submission package to the document entry.
@@ -343,8 +393,8 @@ public class Iti42SoapForge {
         membership.setSourceObject(submission.getId());
         membership.setTargetObject(document.getId());
         addSlot(membership, "SubmissionSetStatus", MEMBERSHIP_STATUS);
-        if ("UPDATE".equals(operation) && input.documentVersion() != null) {
-            addSlot(membership, "PreviousVersion", input.documentVersion());
+        if ("UPDATE".equals(operation) && document.getVersionInfo() != null) {
+            addSlot(membership, "PreviousVersion", document.getVersionInfo().getVersionName());
         }
         entries.getIdentifiable().add(objects.createAssociation(membership));
 
@@ -386,7 +436,7 @@ public class Iti42SoapForge {
         var input = request;
         addSlot(document, "languageCode", LANGUAGE_CODE);
         addSlot(document, "repositoryUniqueId", input.repositoryUniqueId());
-        addSlot(document, "sourcePatientId", request.patientId());
+        addSlot(document, "sourcePatientId", input.sourcePatientId());
         addSlot(document, "urn:ita:2017:repository-type", input.conservazioneANorma());
         addSlot(document, "urn:ita:2022:documentSigned", DOCUMENT_SIGNED);
         addSlotValues(document, "urn:ita:2022:description", input.descriptions());
@@ -398,11 +448,8 @@ public class Iti42SoapForge {
         addSlot(document, "serviceStopTime", input.serviceStopTime());
         addSlotValues(document, "urn:ihe:iti:xds:2013:referenceIdList", input.referenceIds());
 
-        required(request.applicationId(), "SubjectApplicationId");
-        required(request.applicationVendor(), "SubjectApplicationVendor");
-        required(request.applicationVersion(), "SubjectApplicationVersion");
         addSlot(document, "urn:ihe:iti:xds:2024:SubjectApplication",
-                String.join("^", request.applicationId(), request.applicationVendor(), request.applicationVersion()));
+                input.documentSubjectApplication());
     }
 
     private void coded(RegistryObjectType owner, ClassificationEnum category, GuidedPublicationRequest.Code code) {
@@ -433,13 +480,13 @@ public class Iti42SoapForge {
         return classification;
     }
 
-    private void author(RegistryObjectType owner, String scheme, GuidedPublicationRequest request) {
+    private void author(RegistryObjectType owner, String scheme, String person, String role, String institution) {
         ClassificationType classification = classification(owner, scheme, "");
         classification.setId(DOCUMENT_ENTRY_ID.equals(owner.getId())
                 ? ClassificationEnum.AUTHOR.getId() : "SubmissionSet1_ClassificationAuthor");
-        addSlot(classification, "authorRole", request.role());
-        addSlot(classification, "authorInstitution", request.locality());
-        addSlot(classification, "authorPerson", request.authorPerson());
+        addSlot(classification, "authorRole", role);
+        addSlot(classification, "authorInstitution", institution);
+        addSlot(classification, "authorPerson", person);
     }
 
     private void identifier(RegistryObjectType owner, String label, String scheme, String value) {

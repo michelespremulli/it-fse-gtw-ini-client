@@ -79,12 +79,14 @@ public class Iti42GuidedInjector {
             Il parametro query action accetta CREATE (predefinito), REPLACE o UPDATE.
             Tutti usano RegisterDocumentSet-b e la destinazione registry v1, non ITI-57.
             L'action-id SAML è CREATE per CREATE/REPLACE, UPDATE per UPDATE.
-            REPLACE richiede RPLC.targetObject; UPDATE richiede XDSDocumentEntry.lid.
-            UPDATE riceve tutti i metadati finali: non legge INI e non esegue merge o patch.
+            REPLACE richiede RPLC.targetObject; UPDATE richiede XDSDocumentEntry.uniqueId.
+            UPDATE legge prima i metadati INI per recuperare lid e VersionInfo, anche in dry-run.
+            Riceve gli altri metadati finali dal JSON: non esegue merge o patch.
             I campi specifici di un'altra operazione sono ignorati. SubmissionSetStatus=Original è costante.
-            Il paziente è fornito una sola volta e riutilizzato in header e body.
-            Autore clinico condiviso fra documento e sottomissione; ruolo e istituzione derivati dal contesto.
-            SourceId e data sottomissione sono derivati; MIME fisso al valore del Dispatcher.
+            Parametri piatti orientati alle destinazioni SOAP, senza gruppi CSV/JWT.
+            Pazienti, autori e applicazioni del Body sono indipendenti dagli attributi SAML.
+            Documento e sottomissione hanno pazienti e autori distinti, senza fallback impliciti.
+            SourceId è fornito completo; solo la data sottomissione è generata. MIME fisso al valore del Dispatcher.
             Tempi SAML, contesto X509 e autenticatore seguono i builder esistenti.
             Non verifica conformità INI.
             Forge completa il SOAP; l'Injector serializza una sola volta lo stesso messaggio,
@@ -101,7 +103,7 @@ public class Iti42GuidedInjector {
             })
     @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri non validi; action supporta CREATE, REPLACE e UPDATE. "
             + "Riferimento obbligatorio per REPLACE/UPDATE mancante.")
-    @ApiResponse(responseCode = "500", description = "Costruzione o firma fallita; nessuna trasmissione eseguita.")
+    @ApiResponse(responseCode = "500", description = "Lettura INI, costruzione o firma fallita; nessun aggiornamento ITI-42 trasmesso.")
     @ApiResponse(responseCode = "502", description = "Errore di trasporto, SOAP Fault o rifiuto del registro. "
             + "Dopo un tentativo di trasmissione la consegna può essere incerta: non ripetere automaticamente.")
     public ResponseEntity<?> publish(
@@ -109,7 +111,8 @@ public class Iti42GuidedInjector {
             @Parameter(description = "Operazione ITI-42: CREATE (predefinito), REPLACE o UPDATE v1. Non è l'action-id SAML.",
                     schema = @Schema(allowableValues = {"CREATE", "REPLACE", "UPDATE"}, defaultValue = "CREATE"))
             @RequestParam(name = "action", defaultValue = "CREATE") String action,
-            @Parameter(description = "true (predefinito): sola anteprima; false: invio HTTPS effettivo a INI.") @RequestParam(defaultValue = "true") boolean dryRun) {
+            @Parameter(description = "true (predefinito): anteprima senza invio ITI-42; UPDATE esegue comunque la lettura INI. "
+                    + "false: invio effettivo a INI.") @RequestParam(defaultValue = "true") boolean dryRun) {
         try {
             if (!"CREATE".equals(action) && !"REPLACE".equals(action) && !"UPDATE".equals(action)) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Supported ITI-42 actions: CREATE, REPLACE, UPDATE");
@@ -117,8 +120,8 @@ public class Iti42GuidedInjector {
             if ("REPLACE".equals(action) && (input.replacementTarget() == null || input.replacementTarget().isBlank())) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "REPLACE requires RPLC.targetObject");
             }
-            if ("UPDATE".equals(action) && (input.documentLogicalId() == null || input.documentLogicalId().isBlank())) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "UPDATE requires XDSDocumentEntry.lid");
+            if ("UPDATE".equals(action) && (input.documentUniqueId() == null || input.documentUniqueId().isBlank())) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "UPDATE requires XDSDocumentEntry.uniqueId");
             }
             ForgedIti42Request request = forge.forge(input, action);
 
@@ -141,7 +144,7 @@ public class Iti42GuidedInjector {
             // Do not expose credential paths, passwords, or request values in error
             // messages.
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "ITI-42 preparation failed; no request was transmitted");
+                    "ITI-42 preparation failed; no ITI-42 registration was transmitted");
         }
     }
 
