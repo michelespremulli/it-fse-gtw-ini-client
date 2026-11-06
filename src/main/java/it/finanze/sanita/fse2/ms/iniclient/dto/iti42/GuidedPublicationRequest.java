@@ -8,6 +8,9 @@ import io.swagger.v3.oas.annotations.media.Schema;
 
 @Schema(description = "Proprietà JSON allineate al SOAP: URN degli attributi SAML e nomi XDS qualificati. "
         + "I punti nei nomi sono letterali, non oggetti annidati. I valori Header e Body sono indipendenti. "
+        + "UPDATE modifica il documento INI esistente: usa solo classCode, healthcareFacilityTypeCode, practiceSettingCode, eventCodeList, "
+        + "serviceStartTime, serviceStopTime, description e administrativeRequest per il documento; gli altri campi documento sono conservati. "
+        + "In UPDATE sourceId e patientId della sottomissione derivano dal contesto SAML e l'autore è copiato dal documento. "
         + "Costanti e ID tecnici sono interni; nessuna validazione di conformità INI. "
         + "Gli esempi sono sintetici per dry-run, non valori predefiniti né dati qualificati per l'invio a INI.")
 public record GuidedPublicationRequest(
@@ -44,6 +47,9 @@ public record GuidedPublicationRequest(
 
         @JsonProperty("XDSDocumentEntry.title")
         @Schema(description = "Titolo opzionale, serializzato come rim:Name.", example = "Referto di laboratorio - esempio dry-run") String title,
+        @JsonProperty("XDSDocumentEntry.mimeType")
+        @Schema(description = "Tipo MIME del documento, copiato nell'attributo ExtrinsicObject.mimeType senza derivazioni o valore predefinito.",
+                example = "application/pdf+text/x-cda-r2+xml") String mimeType,
         @JsonProperty("XDSDocumentEntry.repositoryUniqueId")
         @Schema(description = "Valore dello slot repositoryUniqueId.", example = "2.16.840.1.113883.2.9.2.950.4.5.1") String repositoryUniqueId,
         @JsonProperty("XDSDocumentEntry.patientId")
@@ -104,6 +110,7 @@ public record GuidedPublicationRequest(
                 example = "{\"nodeRepresentation\":\"11502-2\",\"rim:Name\":\"Referto di laboratorio\"}") Code typeCode,
         @JsonProperty("XDSDocumentEntry.eventCodeList")
         @Schema(description = "Codice e nome espliciti per ogni classificazione evento; nessun lookup da enum. "
+                + "UPDATE deduplica per codice con HashMap: prevale l'ultimo nome fornito e l'ordine non è garantito. "
                 + "Esempio illustrativo, da adattare al documento.",
                 example = "[{\"nodeRepresentation\":\"J07AC\",\"rim:Name\":\"Anthrax vaccines\"}]") List<Code> eventCodes,
         @JsonProperty("XDSDocumentEntry.author.authorPerson")
@@ -115,18 +122,18 @@ public record GuidedPublicationRequest(
         @Schema(description = "Istituzione dell'autore del documento, indipendente dalla località SAML.",
                 example = "Ospedale documentale^^^^^&2.16.840.1.113883.2.9.4.1.3&ISO^^^^950001") String documentAuthorInstitution,
         @JsonProperty("XDSSubmissionSet.sourceId")
-        @Schema(description = "Identificativo completo della sorgente della sottomissione; non derivato da organization-id.",
+        @Schema(description = "CREATE/REPLACE: identificativo completo della sorgente. UPDATE ignora questo campo e deriva sourceId da organization-id.",
                 example = "2.16.840.1.113883.2.9.2.120") String submissionSourceId,
         @JsonProperty("XDSSubmissionSet.patientId")
-        @Schema(description = "Identificativo esterno paziente della sottomissione, indipendente dal documento e da SAML.",
+        @Schema(description = "CREATE/REPLACE: identificativo paziente della sottomissione. UPDATE ignora questo campo e usa resource-id SAML.",
                 example = "RSSMRA80A01H501U^^^&2.16.840.1.113883.2.9.4.3.2&ISO") String submissionPatientId,
         @JsonProperty("XDSSubmissionSet.author.authorPerson")
-        @Schema(description = "Autore completo della sottomissione, indipendente dall'autore del documento.",
+        @Schema(description = "CREATE/REPLACE: autore della sottomissione. UPDATE ignora questo campo e copia l'autore del documento INI.",
                 example = "BNCLGU75B15F205X^Bianchi^Luigi^^^^^^&2.16.840.1.113883.2.9.4.3.2&ISO") String submissionAuthorPerson,
         @JsonProperty("XDSSubmissionSet.author.authorRole")
-        @Schema(description = "Ruolo dell'autore della sottomissione, indipendente da documento e SAML.", example = "APR") String submissionAuthorRole,
+        @Schema(description = "CREATE/REPLACE: ruolo autore sottomissione. UPDATE ignora questo campo e copia l'autore del documento INI.", example = "APR") String submissionAuthorRole,
         @JsonProperty("XDSSubmissionSet.author.authorInstitution")
-        @Schema(description = "Istituzione dell'autore della sottomissione, indipendente da documento e SAML.",
+        @Schema(description = "CREATE/REPLACE: istituzione autore sottomissione. UPDATE ignora questo campo e copia l'autore del documento INI.",
                 example = "Ente inviante^^^^^&2.16.840.1.113883.2.9.4.1.3&ISO^^^^950002") String submissionAuthorInstitution,
         @JsonProperty("XDSSubmissionSet.uniqueId")
         @Schema(description = "Identificativo esterno della sottomissione.",

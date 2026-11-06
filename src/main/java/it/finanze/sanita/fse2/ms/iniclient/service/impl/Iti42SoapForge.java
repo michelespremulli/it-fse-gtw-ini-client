@@ -11,19 +11,14 @@
  */
 package it.finanze.sanita.fse2.ms.iniclient.service.impl;
 
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.net.URI;
-import java.security.KeyStore;
-import java.security.PrivateKey;
-import java.security.cert.X509Certificate;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
+import java.text.SimpleDateFormat;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import org.joda.time.DateTime;
@@ -67,7 +62,6 @@ import org.opensaml.ws.wssecurity.Security;
 import org.opensaml.ws.wssecurity.WSSecurityConstants;
 import org.opensaml.xml.schema.XSString;
 import org.opensaml.xml.schema.impl.XSStringBuilder;
-import org.opensaml.xml.security.x509.BasicX509Credential;
 import org.opensaml.xml.signature.Signature;
 import org.opensaml.xml.signature.SignatureConstants;
 import org.opensaml.xml.signature.Signer;
@@ -75,7 +69,6 @@ import org.opensaml.xml.signature.impl.KeyInfoBuilder;
 import org.opensaml.xml.signature.impl.SignatureBuilder;
 import org.opensaml.xml.signature.impl.X509CertificateBuilder;
 import org.opensaml.xml.signature.impl.X509DataBuilder;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -89,7 +82,8 @@ import it.finanze.sanita.fse2.ms.iniclient.enums.ClassificationEnum;
 import it.finanze.sanita.fse2.ms.iniclient.enums.ExternalIdentifierEnum;
 import it.finanze.sanita.fse2.ms.iniclient.enums.ActionEnumType;
 import it.finanze.sanita.fse2.ms.iniclient.enums.SearchTypeEnum;
-import it.finanze.sanita.fse2.ms.iniclient.utility.FileUtility;
+import it.finanze.sanita.fse2.ms.iniclient.singleton.SigningCredentialSingleton;
+import it.finanze.sanita.fse2.ms.iniclient.utility.StringUtility;
 import oasis.names.tc.ebxml_regrep.xsd.lcm._3.SubmitObjectsRequest;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.AssociationType1;
 import oasis.names.tc.ebxml_regrep.xsd.rim._3.ClassificationType;
@@ -118,6 +112,7 @@ import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientCons
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.CLASSIFICATION_ID;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.CODING_SCHEME;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.URN_UUID;
+import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientConstants.SOURCE_ID_PREFIX;
 
 /** ITI-42 construction with preliminary UPDATE metadata lookup, without JWT interpretation. */
 @Component
@@ -157,28 +152,21 @@ public class Iti42SoapForge {
     private static final String SUBJECT_APPLICATION_SLOT = "urn:ihe:iti:xds:2024:SubjectApplication";
 
     private static final String MEMBERSHIP_STATUS = "Original";
-    private static final String DOCUMENT_MIME_TYPE = "application/pdf+text/x-cda-r2+xml";
-    private static final DateTimeFormatter SUBMISSION_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
 
     private final IniCFG config;
     private final IIniClient iniClient;
-    private final String keyStoreType;
     private final ObjectFactory objects = new ObjectFactory();
-    private final BasicX509Credential credential;
     private final JAXBContext binding;
 
-    public Iti42SoapForge(IniCFG config, IIniClient iniClient,
-            @Value("${ini.guided.signing-store-type:PKCS12}") String keyStoreType) {
+    public Iti42SoapForge(IniCFG config, IIniClient iniClient) {
         this.config = config;
         this.iniClient = iniClient;
-        this.keyStoreType = keyStoreType;
 
         try {
             DefaultBootstrap.bootstrap();
-            this.credential = loadCredential();
             this.binding = JAXBContext.newInstance(SubmitObjectsRequest.class);
         } catch (Exception exception) {
-            throw new IllegalStateException("Cannot initialize ITI-42 Forge signing", exception);
+            throw new IllegalStateException("Cannot initialize ITI-42 Forge XML support", exception);
         }
     }
 
@@ -354,17 +342,13 @@ public class Iti42SoapForge {
             throw new IllegalStateException("INI returned no document metadata for UPDATE");
         }
 
-        List<ExtrinsicObjectType> approved = response.getRegistryObjectList().getIdentifiable().stream()
+        return response.getRegistryObjectList().getIdentifiable().stream()
                 .map(entry -> entry.getValue())
                 .filter(ExtrinsicObjectType.class::isInstance)
                 .map(ExtrinsicObjectType.class::cast)
                 .filter(document -> APPROVED_STATUS.equals(document.getStatus()))
-                .toList();
-
-        if (approved.size() != 1) {
-            throw new IllegalStateException("UPDATE requires one Approved document from INI");
-        }
-        return approved.getFirst();
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("UPDATE requires an Approved document from INI"));
     }
 
     private SubmitObjectsRequest buildBody(GuidedPublicationRequest input, String operation,
@@ -373,25 +357,79 @@ public class Iti42SoapForge {
         RegistryObjectListType entries = new RegistryObjectListType();
 
         // ITI-42 registers document metadata; it does not carry the PDF/CDA bytes.
+        boolean update = "UPDATE".equals(operation);
+        ExtrinsicObjectType document;
+        if (update) {
+            document = mergeUpdateDocument(existingDocument, input);
+        } else {
+            document = buildNewDocument(input);
+        }
+        entries.getIdentifiable().add(objects.createExtrinsicObject(document));
+
+        var submissionInput = input;
+        RegistryPackageType submission = new RegistryPackageType();
+        populate(submission, SUBMISSION_ENTRY_ID, null, REGISTRY_PACKAGE_OBJECT_TYPE);
+
+        // Same format and default timezone as the legacy publication/UPDATE path.
+        addSlot(submission, "submissionTime", new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()));
+        coded(submission, SUBMISSION_CONTENT_TYPE_SCHEME,
+                SUBMISSION_CONTENT_TYPE_CODING_SCHEME, submissionInput.contentTypeCode(), "IdContentTypeCode");
+        if (update) {
+            copyUpdateAuthor(document, submission);
+        } else {
+            author(submission, SUBMISSION_AUTHOR_SCHEME, input.submissionAuthorPerson(),
+                    input.submissionAuthorRole(), input.submissionAuthorInstitution());
+        }
+
+        if (update) {
+            required(input.organizationId(), SAML_ORGANIZATION_ID);
+        }
+        identifier(submission, "XDSSubmissionSet.sourceId", SUBMISSION_SOURCE_ID_SCHEME,
+                update ? SOURCE_ID_PREFIX + StringUtility.sanitizeSourceId(input.organizationId()) : input.submissionSourceId());
+        identifier(submission, "XDSSubmissionSet.uniqueId", SUBMISSION_UNIQUE_ID_SCHEME, input.submissionUniqueId());
+        identifier(submission, "XDSSubmissionSet.patientId", SUBMISSION_PATIENT_ID_SCHEME,
+                update ? input.patientId() : input.submissionPatientId());
+        entries.getIdentifiable().add(objects.createRegistryPackage(submission));
+
+        // The association links the submission package to the document entry.
+        AssociationType1 membership = new AssociationType1();
+        membership.setId(registryId());
+        membership.setAssociationType(HAS_MEMBER_ASSOCIATION_TYPE);
+        membership.setSourceObject(submission.getId());
+        membership.setTargetObject(document.getId());
+        addSlot(membership, "SubmissionSetStatus", MEMBERSHIP_STATUS);
+        if (update && document.getVersionInfo() != null) {
+            addSlot(membership, "PreviousVersion", document.getVersionInfo().getVersionName());
+        }
+        entries.getIdentifiable().add(objects.createAssociation(membership));
+
+        if ("REPLACE".equals(operation)) {
+            AssociationType1 replacement = new AssociationType1();
+            replacement.setId("SubmissionSet1_Association_1");
+            replacement.setAssociationType(REPLACEMENT_ASSOCIATION_TYPE);
+            replacement.setSourceObject(document.getId());
+            replacement.setTargetObject(input.replacementTarget());
+            entries.getIdentifiable().add(objects.createAssociation(replacement));
+        }
+
+        ClassificationType marker = new ClassificationType();
+        marker.setId(CLASSIFICATION_ID);
+        marker.setClassificationNode(SUBMISSION_SET_CLASSIFICATION_NODE);
+        marker.setClassifiedObject(submission.getId());
+        marker.setObjectType(CLASSIFICATION_OBJECT_URN);
+        entries.getIdentifiable().add(objects.createClassification(marker));
+
+        SubmitObjectsRequest body = new SubmitObjectsRequest();
+        body.setRegistryObjectList(entries);
+        return body;
+    }
+
+    private ExtrinsicObjectType buildNewDocument(GuidedPublicationRequest input) {
         var documentInput = input;
         ExtrinsicObjectType document = new ExtrinsicObjectType();
-        document.setMimeType(DOCUMENT_MIME_TYPE);
+        document.setMimeType(documentInput.mimeType());
         document.setIsOpaque(false);
         populate(document, DOCUMENT_ENTRY_ID, documentInput.title(), DOCUMENT_OBJECT_TYPE);
-
-        if ("UPDATE".equals(operation)) {
-            // Guided UPDATE receives the complete desired snapshot, not a patch to merge.
-            String logicalId = existingDocument.getLid();
-            if (logicalId == null || logicalId.isEmpty()) {
-                logicalId = existingDocument.getId();
-            }
-            required(logicalId, "INI document lid or id");
-            if (logicalId.isBlank()) {
-                throw new IllegalStateException("INI returned no usable document identifier for UPDATE");
-            }
-            document.setLid(logicalId);
-            document.setVersionInfo(existingDocument.getVersionInfo());
-        }
 
         documentSlots(document, input);
         coded(document, ClassificationEnum.CLASS_CODE, documentInput.classCode());
@@ -416,58 +454,100 @@ public class Iti42SoapForge {
 
         identifier(document, "XDSDocumentEntry.patientId", ExternalIdentifierEnum.PATIENT.getClassificationScheme(), input.documentPatientId());
         identifier(document, "XDSDocumentEntry.uniqueId", ExternalIdentifierEnum.UnIQUE_ID.getClassificationScheme(), input.documentUniqueId());
-        entries.getIdentifiable().add(objects.createExtrinsicObject(document));
+        return document;
+    }
 
-        var submissionInput = input;
-        RegistryPackageType submission = new RegistryPackageType();
-        populate(submission, SUBMISSION_ENTRY_ID, null, REGISTRY_PACKAGE_OBJECT_TYPE);
-
-        // Match Dispatcher's SimpleDateFormat behavior using the server's timezone.
-        addSlot(submission, "submissionTime", SUBMISSION_TIME_FORMAT.format(Instant.now().atZone(ZoneId.systemDefault())));
-        coded(submission, SUBMISSION_CONTENT_TYPE_SCHEME,
-                SUBMISSION_CONTENT_TYPE_CODING_SCHEME, submissionInput.contentTypeCode(), "IdContentTypeCode");
-        author(submission, SUBMISSION_AUTHOR_SCHEME, input.submissionAuthorPerson(),
-                input.submissionAuthorRole(), input.submissionAuthorInstitution());
-
-        identifier(submission, "XDSSubmissionSet.sourceId", SUBMISSION_SOURCE_ID_SCHEME,
-                input.submissionSourceId());
-        identifier(submission, "XDSSubmissionSet.uniqueId", SUBMISSION_UNIQUE_ID_SCHEME, input.submissionUniqueId());
-        identifier(submission, "XDSSubmissionSet.patientId", SUBMISSION_PATIENT_ID_SCHEME, input.submissionPatientId());
-        entries.getIdentifiable().add(objects.createRegistryPackage(submission));
-
-        // The association links the submission package to the document entry.
-        AssociationType1 membership = new AssociationType1();
-        membership.setId(registryId());
-        membership.setAssociationType(HAS_MEMBER_ASSOCIATION_TYPE);
-        membership.setSourceObject(submission.getId());
-        membership.setTargetObject(document.getId());
-        addSlot(membership, "SubmissionSetStatus", MEMBERSHIP_STATUS);
-        if ("UPDATE".equals(operation) && document.getVersionInfo() != null) {
-            addSlot(membership, "PreviousVersion", document.getVersionInfo().getVersionName());
+    private ExtrinsicObjectType mergeUpdateDocument(ExtrinsicObjectType document, GuidedPublicationRequest input) {
+        String logicalId = document.getLid();
+        if (logicalId == null || logicalId.isEmpty()) {
+            logicalId = document.getId();
         }
-        entries.getIdentifiable().add(objects.createAssociation(membership));
-
-        if ("REPLACE".equals(operation)) {
-            AssociationType1 replacement = new AssociationType1();
-            replacement.setId("SubmissionSet1_Association_1");
-            replacement.setAssociationType(REPLACEMENT_ASSOCIATION_TYPE);
-            replacement.setSourceObject(document.getId());
-            replacement.setTargetObject(input.replacementTarget());
-            entries.getIdentifiable().add(objects.createAssociation(replacement));
+        required(logicalId, "INI document lid or id");
+        if (logicalId.isBlank()) {
+            throw new IllegalStateException("INI returned no usable document identifier for UPDATE");
         }
+        document.setLid(logicalId);
+        document.setId(DOCUMENT_ENTRY_ID);
 
-        // This standard marker identifies the RegistryPackage as an XDS SubmissionSet.
-        ClassificationType marker = new ClassificationType();
-        marker.setId(CLASSIFICATION_ID);
-        marker.setClassificationNode(SUBMISSION_SET_CLASSIFICATION_NODE);
-        marker.setClassifiedObject(submission.getId());
-        marker.setObjectType(CLASSIFICATION_OBJECT_URN);
-        entries.getIdentifiable().add(objects.createClassification(marker));
+        replaceUpdateCode(document, ClassificationEnum.HEALTH_CARE_FACILITY_TYPE_CODE, input.healthcareFacilityTypeCode());
+        replaceUpdateCode(document, ClassificationEnum.CLASS_CODE, input.classCode());
+        replaceUpdateCode(document, ClassificationEnum.PRACTICE_SETTING_CODE, input.practiceSettingCode());
+        removeFirstClassification(document, ClassificationEnum.EVENT_CODE);
+        // Match the legacy merge: one replacement per code, with the last supplied value winning.
+        Map<String, GuidedPublicationRequest.Code> eventsByCode = new HashMap<>();
+        for (var event : supplied(input.eventCodes())) {
+            if (event != null) {
+                eventsByCode.put(event.value(), event);
+            }
+        }
+        int index = 0;
+        for (var event : eventsByCode.values()) {
+            coded(document, ClassificationEnum.EVENT_CODE.getClassificationScheme(),
+                    ClassificationEnum.EVENT_CODE.getCodingScheme(), event,
+                    ClassificationEnum.EVENT_CODE.getId() + "_" + index++);
+        }
+        replaceUpdateSlot(document, "serviceStartTime", input.serviceStartTime() == null ? null : List.of(input.serviceStartTime()));
+        replaceUpdateSlot(document, "serviceStopTime", input.serviceStopTime() == null ? null : List.of(input.serviceStopTime()));
+        // The legacy merge keeps only the first supplied description.
+        replaceUpdateSlot(document, DESCRIPTION_SLOT, supplied(input.descriptions()).stream().limit(1).toList());
+        replaceUpdateSlot(document, ADMINISTRATIVE_REQUEST_SLOT, input.administrativeRequests());
 
-        SubmitObjectsRequest body = new SubmitObjectsRequest();
-        body.setRegistryObjectList(entries);
+        for (var classification : document.getClassification()) {
+            classification.setClassifiedObject(DOCUMENT_ENTRY_ID);
+            classification.setLid(null);
+            for (var category : ClassificationEnum.values()) {
+                if (category.getClassificationScheme().equals(classification.getClassificationScheme())) {
+                    classification.setId(category.getId());
+                    break;
+                }
+            }
+        }
+        for (var external : document.getExternalIdentifier()) {
+            external.setRegistryObject(DOCUMENT_ENTRY_ID);
+            external.setLid(null);
+            for (var category : ExternalIdentifierEnum.values()) {
+                if (category.getClassificationScheme().equals(external.getIdentificationScheme())) {
+                    external.setId(category.getId());
+                    break;
+                }
+            }
+        }
+        return document;
+    }
 
-        return body;
+    private void removeFirstClassification(ExtrinsicObjectType document, ClassificationEnum category) {
+        document.getClassification().stream()
+                .filter(value -> category.getClassificationScheme().equals(value.getClassificationScheme()))
+                .findFirst().ifPresent(document.getClassification()::remove);
+    }
+
+    private void replaceUpdateCode(ExtrinsicObjectType document, ClassificationEnum category,
+            GuidedPublicationRequest.Code code) {
+        removeFirstClassification(document, category);
+        coded(document, category, code);
+    }
+
+    private void replaceUpdateSlot(ExtrinsicObjectType document, String slotName, List<String> values) {
+        document.getSlot().stream().filter(value -> slotName.equals(value.getName()))
+                .findFirst().ifPresent(document.getSlot()::remove);
+        addSlotValues(document, slotName, values);
+    }
+
+    private void copyUpdateAuthor(ExtrinsicObjectType document, RegistryPackageType submission) {
+        document.getClassification().stream()
+                .filter(value -> ClassificationEnum.AUTHOR.getClassificationScheme().equals(value.getClassificationScheme()))
+                .findFirst().ifPresent(existing -> {
+                    ClassificationType copy = new ClassificationType();
+                    copy.setId("SubmissionSet1_ClassificationAuthor");
+                    copy.setClassificationNode(existing.getClassificationNode());
+                    copy.setClassificationScheme(SUBMISSION_AUTHOR_SCHEME);
+                    copy.setClassifiedObject(submission.getId());
+                    copy.setName(existing.getName());
+                    copy.setObjectType(existing.getObjectType());
+                    copy.setNodeRepresentation(existing.getNodeRepresentation());
+                    copy.getSlot().addAll(existing.getSlot());
+                    submission.getClassification().add(copy);
+                });
     }
 
     private void populate(RegistryObjectType output, String id, String name, String objectType) {
@@ -592,49 +672,10 @@ public class Iti42SoapForge {
         return name;
     }
 
-    private BasicX509Credential loadCredential() throws Exception {
-        required(config.getKeyStorePassword(), "signing keystore password");
-        required(config.getKeyStoreLocation(), "signing keystore location");
-
-        KeyStore store = KeyStore.getInstance(keyStoreType);
-        char[] password = config.getKeyStorePassword().toCharArray();
-
-        try (InputStream stream = FileUtility.getFileFromAbsoluteOrResourceInputStream(config.getKeyStoreLocation())) {
-            store.load(stream, password);
-        }
-
-        String alias = config.getKeyStoreAlias();
-        if (alias == null || alias.isBlank()) {
-            List<String> keys = Collections.list(store.aliases()).stream().filter(value -> {
-                try {
-                    return store.isKeyEntry(value);
-                } catch (Exception exception) {
-                    throw new IllegalStateException(exception);
-                }
-            }).toList();
-
-            if (keys.size() != 1) {
-                throw new IllegalStateException("Configure an unambiguous signing alias");
-            }
-
-            alias = keys.getFirst();
-        }
-
-        if (!(store.getKey(alias, password) instanceof PrivateKey key)
-                || !(store.getCertificate(alias) instanceof X509Certificate certificate)
-                || !"RSA".equals(key.getAlgorithm())) {
-            throw new IllegalStateException("Signing alias must contain an RSA private key and X509 certificate");
-        }
-
-        BasicX509Credential result = new BasicX509Credential();
-        result.setPrivateKey(key);
-        result.setEntityCertificate(certificate);
-
-        return result;
-    }
-
     private void sign(Assertion assertion) throws Exception {
 
+        // Use exactly the same credential selection and cache as the legacy SAML builder.
+        var credential = SigningCredentialSingleton.getInstance(config);
         Signature signature = new SignatureBuilder().buildObject();
         signature.setSigningCredential(credential);
         signature.setSignatureAlgorithm(SignatureConstants.ALGO_ID_SIGNATURE_RSA_SHA256);

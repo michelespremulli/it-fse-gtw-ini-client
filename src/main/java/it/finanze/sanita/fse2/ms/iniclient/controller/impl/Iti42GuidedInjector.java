@@ -80,13 +80,13 @@ public class Iti42GuidedInjector {
             Tutti usano RegisterDocumentSet-b e la destinazione registry v1, non ITI-57.
             L'action-id SAML è CREATE per CREATE/REPLACE, UPDATE per UPDATE.
             REPLACE richiede RPLC.targetObject; UPDATE richiede XDSDocumentEntry.uniqueId.
-            UPDATE legge prima i metadati INI per recuperare lid e VersionInfo, anche in dry-run.
-            Riceve gli altri metadati finali dal JSON: non esegue merge o patch.
+            UPDATE legge INI anche in dry-run, seleziona il primo documento Approved e modifica solo classificazioni e slot previsti dal merge legacy.
+            Conserva gli altri metadati, lid e VersionInfo; null rimuove i metadati oggetto del merge, non significa conservarli.
             I campi specifici di un'altra operazione sono ignorati. SubmissionSetStatus=Original è costante.
             Parametri piatti orientati alle destinazioni SOAP, senza gruppi CSV/JWT.
-            Pazienti, autori e applicazioni del Body sono indipendenti dagli attributi SAML.
-            Documento e sottomissione hanno pazienti e autori distinti, senza fallback impliciti.
-            SourceId è fornito completo; solo la data sottomissione è generata. MIME fisso al valore del Dispatcher.
+            CREATE/REPLACE hanno pazienti, autori, applicazioni, SourceId e MIME espliciti e indipendenti.
+            UPDATE deriva SourceId da organization-id e patientId della sottomissione da resource-id; copia l'autore del documento.
+            submissionTime è generato a runtime per tutte le operazioni, nel formato yyyyMMddHHmmss e fuso orario del server.
             Tempi SAML, contesto X509 e autenticatore seguono i builder esistenti.
             Non verifica conformità INI.
             Forge completa il SOAP; l'Injector serializza una sola volta lo stesso messaggio,
