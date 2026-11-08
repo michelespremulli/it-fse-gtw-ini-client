@@ -1,0 +1,33 @@
+package it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions;
+
+import javax.xml.soap.SOAPPart;
+import javax.xml.xpath.XPathExpressionException;
+
+import org.springframework.stereotype.Component;
+
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.EnvelopeXPathEnum;
+import lombok.RequiredArgsConstructor;
+
+@Component
+@RequiredArgsConstructor
+public class PIT1Assertion extends AbstractShieldAssertion {
+
+    private final XPathUtility xPathUtility;
+
+    @Override
+    public AssertionResultDto evaluate(SOAPPart document)
+            throws XPathExpressionException {
+
+        String issuer = xPathUtility.extract(
+                document,
+                EnvelopeXPathEnum.SAML_ISSUER);
+
+        boolean output =
+                issuer != null &&
+                !issuer.trim().isEmpty();
+
+        return AssertionResultDto.builder()
+                .output(output)
+                .build();
+    }
+}

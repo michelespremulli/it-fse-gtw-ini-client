@@ -10,7 +10,6 @@
  * You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 package it.finanze.sanita.fse2.ms.iniclient.client.impl;
-
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.EVENT_DATE;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.EVENT_TYPE;
 import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.WII;
@@ -28,6 +27,7 @@ import java.net.ProxySelector;
 import java.net.SocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
@@ -41,12 +41,15 @@ import java.util.stream.Collectors;
 import javax.annotation.PostConstruct;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Unmarshaller;
+import javax.xml.namespace.QName;
+import javax.xml.soap.SOAPPart;
 import javax.xml.ws.BindingProvider;
 import javax.xml.ws.Holder;
 import javax.xml.ws.handler.Handler;
 import javax.xml.ws.handler.MessageContext;
 
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
 
@@ -61,6 +64,9 @@ import ihe.iti.xds_b._2007.UpdateDocumentRegistryService;
 import ihe.iti.xds_b._2010.XDSDeletetWS;
 import ihe.iti.xds_b._2010.XDSDeletetWSService;
 import it.finanze.sanita.fse2.ms.iniclient.client.IIniClient;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.SAMLShieldHandler;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.ShieldAssertionEngine;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.XPathUtility;
 import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
 import it.finanze.sanita.fse2.ms.iniclient.dto.DeleteRequestDTO;
@@ -87,32 +93,61 @@ import oasis.names.tc.ebxml_regrep.xsd.query._3.AdhocQueryRequest;
 import oasis.names.tc.ebxml_regrep.xsd.query._3.AdhocQueryResponse;
 import oasis.names.tc.ebxml_regrep.xsd.rs._3.RegistryError;
 import oasis.names.tc.ebxml_regrep.xsd.rs._3.RegistryResponseType;
+import java.util.List;
 
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Unmarshaller;
+import javax.xml.namespace.QName;
+import javax.xml.soap.MessageFactory;
+import javax.xml.soap.SOAPConstants;
+import javax.xml.soap.SOAPMessage;
+import javax.xml.soap.SOAPPart;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.ws.BindingProvider;
+import javax.xml.ws.Dispatch;
+import javax.xml.ws.Service;
+
+import oasis.names.tc.ebxml_regrep.xsd.rs._3.RegistryResponseType;
 /**
  * Production implemention of Ini Client.
  */
+
+
+
 @Slf4j
 @Component
 public class IniClient implements IIniClient {
 
-	@Autowired
-	private IniCFG iniCFG;
+    private final XPathUtility XPathUtility;
 
-	@Autowired
-	private SamlHeaderBuilderUtility samlHeaderBuilderUtility;
+    private final IniCFG iniCFG;
+    private final SamlHeaderBuilderUtility samlHeaderBuilderUtility;
+    private final ISecuritySRV securitySRV;
+    private final AuditIniSrv auditIniSrv;
+    private final IConfigSRV configSRV;
+    private final GovwayCfg govwayCfg;
+    private final ShieldAssertionEngine shieldAssertionEngine;
 
-	@Autowired
-	private ISecuritySRV securitySRV;
-	
-	@Autowired
-	private AuditIniSrv auditIniSrv;
+    public IniClient(
+            IniCFG iniCFG,
+            SamlHeaderBuilderUtility samlHeaderBuilderUtility,
+            ISecuritySRV securitySRV,
+            AuditIniSrv auditIniSrv,
+            IConfigSRV configSRV,
+            GovwayCfg govwayCfg,
+            XPathUtility xPathUtility,
+            ShieldAssertionEngine shieldAssertionEngine, XPathUtility XPathUtility) {
 
-	@Autowired
-	private IConfigSRV configSRV;
-	
-	@Autowired
-	private GovwayCfg govwayCfg;
-
+        this.iniCFG = iniCFG;
+        this.samlHeaderBuilderUtility = samlHeaderBuilderUtility;
+        this.securitySRV = securitySRV;
+        this.auditIniSrv = auditIniSrv;
+        this.configSRV = configSRV;
+        this.govwayCfg = govwayCfg;
+        this.shieldAssertionEngine = shieldAssertionEngine;
+        this.XPathUtility = XPathUtility;
+    }
+    
 	private SSLContext sslContext;
 
 	private List<URI> uris;
@@ -147,6 +182,7 @@ public class IniClient implements IIniClient {
 		}
 		List<Handler> handlerChain = provider.getBinding().getHandlerChain();
 		handlerChain.add(new SOAPLoggingHandler(auditIniSrv, configSRV));
+		handlerChain.add(new SAMLShieldHandler(shieldAssertionEngine));
 		provider.getBinding().setHandlerChain(handlerChain);
 		return port;
 	}
@@ -397,6 +433,85 @@ public class IniClient implements IIniClient {
 		}
 		return response;
 	}
- 
- 
+
+	@Override
+	public RegistryResponseType sendRawData(final SOAPPart document) {
+
+	    try {
+
+	        DocumentRegistryService service =
+	                new DocumentRegistryService();
+
+	        Dispatch<SOAPMessage> dispatch =
+	                service.createDispatch(
+	                        new QName(
+	                                "urn:ihe:iti:xds-b:2007",
+	                                "DocumentRegistry_Port_Soap12"),
+	                        SOAPMessage.class,
+	                        Service.Mode.MESSAGE);
+
+	        BindingProvider bp = (BindingProvider) dispatch;
+
+	        if (!StringUtility.isNullOrEmpty(
+	                iniCFG.getUrlWsdlDocumentRegistryService())) {
+
+	            bp.getRequestContext().put(
+	                    BindingProvider.ENDPOINT_ADDRESS_PROPERTY,
+	                    iniCFG.getUrlWsdlDocumentRegistryService());
+	        }
+
+	        if (Boolean.TRUE.equals(iniCFG.isEnableSSL())) {
+	            bp.getRequestContext().put(
+	                    JAXWSProperties.SSL_SOCKET_FACTORY,
+	                    sslContext.getSocketFactory());
+	        }
+
+	        List<Handler> handlerChain =
+	                new ArrayList<>(dispatch.getBinding().getHandlerChain());
+
+	        handlerChain.add(
+	                new SOAPLoggingHandler(
+	                        auditIniSrv,
+	                        configSRV));
+
+	        handlerChain.add(
+	                new SAMLShieldHandler(
+	                        shieldAssertionEngine));
+
+	        dispatch.getBinding().setHandlerChain(
+	                handlerChain);
+
+	        SOAPMessage request =
+	                MessageFactory.newInstance(
+	                        SOAPConstants.SOAP_1_2_PROTOCOL)
+	                        .createMessage();
+
+	        request.getSOAPPart().setContent(
+	                document.getContent());
+
+	        request.saveChanges();
+
+	        SOAPMessage response =
+	                dispatch.invoke(request);
+
+	        JAXBContext jaxbContext =
+	                JAXBContext.newInstance(
+	                        RegistryResponseType.class);
+
+	        Unmarshaller unmarshaller =
+	                jaxbContext.createUnmarshaller();
+
+	        return (RegistryResponseType)
+	                unmarshaller.unmarshal(
+	                        response.getSOAPBody()
+	                                .extractContentAsDocument());
+
+	    } catch (Exception e) {
+
+	        throw new RuntimeException(
+	                "Unable to send raw SOAP request",
+	                e);
+	    }
+	}
+	
 }

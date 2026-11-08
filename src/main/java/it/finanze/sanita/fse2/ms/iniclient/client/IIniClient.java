@@ -14,6 +14,8 @@ package it.finanze.sanita.fse2.ms.iniclient.client;
 import java.util.Date;
 import java.util.List;
 
+import javax.xml.soap.SOAPPart;
+
 import it.finanze.sanita.fse2.ms.iniclient.dto.DeleteRequestDTO;
 import it.finanze.sanita.fse2.ms.iniclient.dto.DocumentEntryDTO;
 import it.finanze.sanita.fse2.ms.iniclient.dto.JWTPayloadDTO;
@@ -47,5 +49,7 @@ public interface IIniClient {
     
     AdhocQueryResponse getReferenceMetadata(String uuid, String tipoRicerca, JWTTokenDTO jwtToken, ActionEnumType actionEnumType,
 			String workflowInstanceId,Date startingDate);
+
+	RegistryResponseType sendRawData(SOAPPart document);
 
 }
