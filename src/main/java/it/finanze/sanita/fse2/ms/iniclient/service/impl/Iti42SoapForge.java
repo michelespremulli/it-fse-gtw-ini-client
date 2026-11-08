@@ -486,10 +486,12 @@ public class Iti42SoapForge {
                     ClassificationEnum.EVENT_CODE.getCodingScheme(), event,
                     ClassificationEnum.EVENT_CODE.getId() + "_" + index++);
         }
-        replaceUpdateSlot(document, "serviceStartTime", input.serviceStartTime() == null ? null : List.of(input.serviceStartTime()));
-        replaceUpdateSlot(document, "serviceStopTime", input.serviceStopTime() == null ? null : List.of(input.serviceStopTime()));
+        // Legacy passes nullable service times as individual varargs values, which
+        // serialize as empty ValueLists rather than omitted slots when null.
+        replaceUpdateSlot(document, "serviceStartTime", input.serviceStartTime() == null ? List.of() : List.of(input.serviceStartTime()));
+        replaceUpdateSlot(document, "serviceStopTime", input.serviceStopTime() == null ? List.of() : List.of(input.serviceStopTime()));
         // The legacy merge keeps only the first supplied description.
-        replaceUpdateSlot(document, DESCRIPTION_SLOT, supplied(input.descriptions()).stream().limit(1).toList());
+        replaceUpdateSlot(document, DESCRIPTION_SLOT, input.descriptions() == null ? null : input.descriptions().stream().limit(1).toList());
         replaceUpdateSlot(document, ADMINISTRATIVE_REQUEST_SLOT, input.administrativeRequests());
 
         for (var classification : document.getClassification()) {
@@ -530,7 +532,11 @@ public class Iti42SoapForge {
     private void replaceUpdateSlot(ExtrinsicObjectType document, String slotName, List<String> values) {
         document.getSlot().stream().filter(value -> slotName.equals(value.getName()))
                 .findFirst().ifPresent(document.getSlot()::remove);
-        addSlotValues(document, slotName, values);
+        // Unlike CREATE/REPLACE, the legacy UPDATE merge preserves an explicitly
+        // empty value list. A null list removes the slot without replacing it.
+        if (values != null) {
+            document.getSlot().add(slot(slotName, values));
+        }
     }
 
     private void copyUpdateAuthor(ExtrinsicObjectType document, RegistryPackageType submission) {
