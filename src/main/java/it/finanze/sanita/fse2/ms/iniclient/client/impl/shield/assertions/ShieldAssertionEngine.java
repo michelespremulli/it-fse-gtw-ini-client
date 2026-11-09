@@ -30,6 +30,13 @@ public class ShieldAssertionEngine {
 	@Autowired
     private ApplicationContext applicationContext;
 
+    /** Read-only checks shared by previews and the outbound SOAP handler. */
+    public void validate(SOAPPart document) {
+        for (XDSFaultEnum fault : XDSFaultEnum.values()) {
+            evaluate(document, fault);
+        }
+    }
+
     public void evaluate(SOAPPart document, XDSFaultEnum fault) {
 	    try {
 	        String message = null;

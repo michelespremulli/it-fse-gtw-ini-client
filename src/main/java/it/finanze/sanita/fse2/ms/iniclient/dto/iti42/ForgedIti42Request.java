@@ -16,7 +16,7 @@ import java.net.URI;
 import javax.xml.soap.SOAPMessage;
 
 /**
- * Request-owned complete SOAP; consumers must not mutate it before serialization.
+ * Request-owned complete SOAP; validators and transport must preserve its signed content.
  */
 public record ForgedIti42Request(
         URI destination,

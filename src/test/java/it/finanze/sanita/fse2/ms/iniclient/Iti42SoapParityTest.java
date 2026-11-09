@@ -16,6 +16,8 @@ import static org.mockito.Mockito.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
@@ -23,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import javax.xml.XMLConstants;
@@ -40,10 +43,16 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.opensaml.xml.security.x509.BasicX509Credential;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpServer;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.ShieldAssertionEngine;
+import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
+import it.finanze.sanita.fse2.ms.iniclient.controller.impl.Iti42GuidedInjector;
+import it.finanze.sanita.fse2.ms.iniclient.service.ISecuritySRV;
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
 import it.finanze.sanita.fse2.ms.iniclient.dto.*;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
@@ -130,6 +139,84 @@ class Iti42SoapParityTest {
             var association = (Element) xml.getElementsByTagNameNS(RIM, "Association").item(0);
             assertEquals("urn:oasis:names:tc:ebxml-regrep:AssociationType:HasMember",
                     association.getAttribute("associationType"));
+        }
+    }
+
+    @Test
+    @DisplayName("Real Forge SOAP passes the outbound Shield handler and retains its signature at the local HTTP receiver")
+    void guidedJaxWsPreservesSignedRequest() throws Exception {
+        AtomicReference<byte[]> received = new AtomicReference<>();
+        AtomicReference<String> contentType = new AtomicReference<>();
+        AtomicReference<String> authorization = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/registry", exchange -> {
+            received.set(exchange.getRequestBody().readAllBytes());
+            contentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
+            authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            byte[] reply = ("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Body>"
+                    + "<RegistryResponse xmlns=\"urn:oasis:names:tc:ebxml-regrep:xsd:rs:3.0\" "
+                    + "status=\"urn:oasis:names:tc:ebxml-regrep:ResponseStatusType:Success\"/>"
+                    + "</s:Body></s:Envelope>").getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/soap+xml; charset=utf-8");
+            exchange.sendResponseHeaders(200, reply.length);
+            exchange.getResponseBody().write(reply);
+            exchange.close();
+        });
+        server.start();
+
+        // Load just the validation beans: no Spring Boot, MongoDB, or external INI.
+        try (var context = new AnnotationConfigApplicationContext();
+                var signing = mockStatic(SigningCredentialSingleton.class)) {
+            context.scan(ShieldAssertionEngine.class.getPackageName());
+            context.refresh();
+            var shield = spy(context.getBean(ShieldAssertionEngine.class));
+            signing.when(() -> SigningCredentialSingleton.getInstance(config)).thenReturn(credential);
+            config.setUrlWsdlDocumentRegistryService("http://127.0.0.1:"
+                    + server.getAddress().getPort() + "/registry");
+
+            // Parity fixtures deliberately use false consent; the Shield's TREATMENT rule requires true.
+            var fields = inputFields();
+            fields.put("urn:oasis:names:tc:xspa:1.0:resource:patient:consent", true);
+            var request = forge.forge(json.convertValue(fields, GuidedPublicationRequest.class));
+            verifySignature(serialized(request.message()));
+            var before = new ByteArrayOutputStream();
+            request.message().writeTo(before);
+
+            shield.validate(request.message().getSOAPPart());
+            var after = new ByteArrayOutputStream();
+            request.message().writeTo(after);
+            assertArrayEquals(before.toByteArray(), after.toByteArray(), "Shield must be read-only");
+            clearInvocations(shield);
+
+            var preparedForge = mock(Iti42SoapForge.class);
+            when(preparedForge.forge(any())).thenReturn(request);
+            var security = mock(ISecuritySRV.class);
+            var govway = new GovwayCfg();
+            govway.setGovwayUser("test-user");
+            govway.setGovwayPass("test-password");
+            var injector = new Iti42GuidedInjector(preparedForge, security, govway, shield);
+
+            var response = injector.publish(json.convertValue(fields, GuidedPublicationRequest.class), false);
+            assertEquals(200, response.getStatusCode().value());
+            var outcome = (Iti42GuidedInjector.PublicationResponse) response.getBody();
+            assertEquals("INI_SUCCESS", outcome.outcome());
+            assertEquals(200, outcome.upstreamHttpStatus());
+            verify(shield).validate(any()); // Executed by the real outbound JAX-WS handler.
+            verifyNoInteractions(security); // Loopback HTTP only.
+
+            assertNotNull(received.get());
+            assertTrue(contentType.get().contains("application/soap+xml"));
+            assertTrue(contentType.get().contains(request.action()));
+            assertEquals("Basic " + java.util.Base64.getEncoder().encodeToString(
+                    "test-user:test-password".getBytes(StandardCharsets.UTF_8)), authorization.get());
+            var factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            var wireXml = factory.newDocumentBuilder().parse(new ByteArrayInputStream(received.get()));
+            verifySignature(wireXml);
+            assertEquals(request.messageId(), wireXml.getElementsByTagNameNS(WSA, "MessageID").item(0).getTextContent());
+        } finally {
+            server.stop(0);
         }
     }
 

@@ -11,19 +11,24 @@
  */
 package it.finanze.sanita.fse2.ms.iniclient.controller.impl;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 
-import javax.net.ssl.HttpsURLConnection;
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.namespace.QName;
 import javax.xml.soap.MessageFactory;
 import javax.xml.soap.SOAPConstants;
 import javax.xml.soap.SOAPMessage;
-import javax.xml.transform.dom.DOMSource;
+import javax.xml.ws.BindingProvider;
+import javax.xml.ws.Dispatch;
+import javax.xml.ws.Service;
+import javax.xml.ws.handler.MessageContext;
+import javax.xml.ws.soap.SOAPBinding;
+import javax.xml.ws.soap.SOAPFaultException;
+
+import com.sun.xml.ws.developer.JAXWSProperties;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
@@ -47,6 +52,9 @@ import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.SAMLShieldHandler;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.ShieldException;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.ShieldAssertionEngine;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.ForgedIti42Request;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
 import it.finanze.sanita.fse2.ms.iniclient.service.ISecuritySRV;
@@ -64,17 +72,20 @@ public class Iti42GuidedInjector {
     private final Iti42SoapForge forge;
     private final ISecuritySRV security;
     private final GovwayCfg govway;
+    private final ShieldAssertionEngine shield;
 
-    public Iti42GuidedInjector(Iti42SoapForge forge, ISecuritySRV security, GovwayCfg govway) {
+    public Iti42GuidedInjector(Iti42SoapForge forge, ISecuritySRV security, GovwayCfg govway,
+            ShieldAssertionEngine shield) {
         this.forge = forge;
         this.security = security;
         this.govway = govway;
+        this.shield = shield;
     }
 
     @PostMapping(value = "/guided", consumes = "application/json")
     @Operation(summary = "Costruisce SOAP ITI-42 CREATE con SAML firmato", description = """
             Con dryRun=true restituisce direttamente i byte XML (application/soap+xml), senza involucro JSON,
-            escape JSON o riformattazione. Con dryRun=false restituisce l'esito JSON e invia i byte SOAP
+            escape JSON o riformattazione. Con dryRun=false restituisce l'esito JSON e invia il SOAP tramite JAX-WS
             alla destinazione configurata sul server. Gli ID tecnici e IssueInstant sono generati;
             Supporta solo CREATE, con RegisterDocumentSet-b e la destinazione registry v1.
             L'action-id SAML è sempre CREATE. Non esegue letture INI.
@@ -83,9 +94,10 @@ public class Iti42GuidedInjector {
             Pazienti, autori, applicazioni, SourceId e MIME sono espliciti e indipendenti.
             submissionTime è generato a runtime per tutte le operazioni, nel formato yyyyMMddHHmmss e fuso orario del server.
             Tempi SAML, contesto X509 e autenticatore seguono i builder esistenti.
-            Non verifica conformità INI.
-            Forge completa il SOAP; l'Injector serializza una sola volta lo stesso messaggio,
-            dopo l'eventuale ispezione in sola lettura di un futuro Shield, senza ricostruirlo.
+            Shield applica controlli parziali, non una verifica completa di conformità INI.
+            Forge completa il SOAP. In anteprima Shield ispeziona il messaggio prima della serializzazione;
+            nell'invio lo stesso messaggio passa al Dispatch JAX-WS e al SOAP handler Shield, senza ricostruirlo.
+            JAX-WS gestisce la serializzazione di trasporto; l'anteprima non garantisce identità byte-per-byte con l'invio.
             Non verifica localmente la firma dopo la serializzazione.
             Non sono previsti controlli di ruolo o un gate separato per l'invio: limitare l'accesso esternamente.
             L'XML contiene dati sensibili e un'asserzione firmata.
@@ -97,6 +109,7 @@ public class Iti42GuidedInjector {
                     @Content(mediaType = "application/json", schema = @Schema(implementation = PublicationResponse.class))
             })
     @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri non validi.")
+    @ApiResponse(responseCode = "422", description = "Richiesta rifiutata da Shield prima della trasmissione.")
     @ApiResponse(responseCode = "500", description = "Costruzione o firma fallita; nessuna registrazione ITI-42 trasmessa.")
     @ApiResponse(responseCode = "502", description = "Errore di trasporto, SOAP Fault o rifiuto del registro. "
             + "Dopo un tentativo di trasmissione la consegna può essere incerta: non ripetere automaticamente.")
@@ -107,92 +120,80 @@ public class Iti42GuidedInjector {
         try {
             ForgedIti42Request request = forge.forge(input);
 
-            // A future read-only Shield inspects request here, including the completed message.
-            // Serialize that same instance once; do not rebuild or format XML after inspection.
-            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            request.message().writeTo(bytes);
-            byte[] soap = bytes.toByteArray();
-
             if (dryRun) {
+                // Preview never invokes transport, so run the handler's shared checks explicitly.
+                shield.validate(request.message().getSOAPPart());
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                request.message().writeTo(bytes);
                 return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                         .contentType(MediaType.parseMediaType("application/soap+xml; charset=UTF-8"))
-                        .body(soap);
+                        .body(bytes.toByteArray());
             }
 
-            return send(request, soap);
+            return send(request);
+        } catch (ShieldException exception) {
+            throw shieldRejection(exception);
         } catch (ResponseStatusException exception) {
             throw exception;
         } catch (Exception exception) {
-            // Do not expose credential paths, passwords, or request values in error
-            // messages.
+            // Do not expose credential paths, passwords, or request values in error messages.
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "ITI-42 preparation failed; no ITI-42 registration was transmitted");
         }
     }
 
-    private SOAPMessage parse(byte[] xml) throws Exception {
-        var factory = DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-
-        // SOAP XML must not resolve external files, schemas or entity URLs.
-        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
-        factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
-
-        var document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xml));
-
-        SOAPMessage message = MessageFactory.newInstance(SOAPConstants.SOAP_1_2_PROTOCOL).createMessage();
-        message.getSOAPPart().setContent(new DOMSource(document));
-
-        return message;
-    }
-
-    private ResponseEntity<PublicationResponse> send(ForgedIti42Request request, byte[] soap) {
-        HttpsURLConnection connection = null;
+    private ResponseEntity<PublicationResponse> send(ForgedIti42Request request) {
+        Dispatch<SOAPMessage> dispatch = null;
         boolean transmissionStarted = false;
 
         try {
-            connection = (HttpsURLConnection) request.destination().toURL().openConnection();
-            connection.setSSLSocketFactory(security.createSslCustomContext().getSocketFactory());
-            connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(10000);
-            connection.setReadTimeout(30000);
-            connection.setRequestMethod("POST");
-            connection.setDoOutput(true);
+            // No WSDL fetch, typed-body reconstruction, or WS-Addressing feature:
+            // the Forge already supplied the complete envelope and its routing headers.
+            QName serviceName = new QName("urn:ihe:iti:xds-b:2007", "GuidedDocumentRegistryService");
+            QName portName = new QName("urn:ihe:iti:xds-b:2007", "DocumentRegistry_Port_Soap12");
+            Service service = Service.create(serviceName);
+            service.addPort(portName, SOAPBinding.SOAP12HTTP_BINDING, request.destination().toString());
+            dispatch = service.createDispatch(portName, SOAPMessage.class, Service.Mode.MESSAGE);
+            dispatch.getBinding().setHandlerChain(List.of(new SAMLShieldHandler(shield)));
 
-            // SOAP 1.2 places the action in Content-Type as well as wsa:Action.
-            connection.setRequestProperty("Content-Type", "application/soap+xml; charset=utf-8; action=\""
-                    + request.action() + "\"");
+            var context = dispatch.getRequestContext();
+            context.put(BindingProvider.SOAPACTION_USE_PROPERTY, true);
+            context.put(BindingProvider.SOAPACTION_URI_PROPERTY, request.action());
+            context.put(JAXWSProperties.CONNECT_TIMEOUT, 10000);
+            context.put(JAXWSProperties.REQUEST_TIMEOUT, 30000);
+            // Streaming mode prevents HttpURLConnection from automatically replaying
+            // the signed POST for a redirect or an authentication challenge.
+            context.put(JAXWSProperties.HTTP_CLIENT_STREAMING_CHUNK_SIZE, 8192);
+            if ("https".equalsIgnoreCase(request.destination().getScheme())) {
+                context.put(JAXWSProperties.SSL_SOCKET_FACTORY,
+                        security.createSslCustomContext().getSocketFactory());
+            }
 
             if (govway.getGovwayUser() != null && !govway.getGovwayUser().isBlank()
                     && govway.getGovwayPass() != null && !govway.getGovwayPass().isBlank()) {
                 String credentials = govway.getGovwayUser() + ":" + govway.getGovwayPass();
-                connection.setRequestProperty("Authorization", "Basic " + Base64.getEncoder()
-                        .encodeToString(credentials.getBytes(StandardCharsets.UTF_8)));
+                context.put(MessageContext.HTTP_REQUEST_HEADERS, Map.of("Authorization", List.of(
+                        "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8)))));
             }
 
-            connection.setFixedLengthStreamingMode(soap.length);
+            // Once invoked, delivery is conservatively uncertain unless Shield rejected
+            // the request in its outbound handler before transport could run.
             transmissionStarted = true;
-
-            try (var output = connection.getOutputStream()) {
-                output.write(soap);
+            SOAPMessage reply;
+            try {
+                reply = dispatch.invoke(request.message());
+            } catch (SOAPFaultException exception) {
+                reply = MessageFactory.newInstance(SOAPConstants.SOAP_1_2_PROTOCOL).createMessage();
+                reply.getSOAPBody().appendChild(reply.getSOAPPart().importNode(exception.getFault(), true));
             }
 
-            int status = connection.getResponseCode();
-            byte[] bytes;
-
-            try (InputStream stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()) {
-                bytes = stream == null ? new byte[0] : stream.readNBytes(MAX_RESPONSE_BYTES + 1);
-            }
-
-            if (bytes.length > MAX_RESPONSE_BYTES) {
+            Integer status = (Integer) dispatch.getResponseContext().get(MessageContext.HTTP_RESPONSE_CODE);
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            reply.writeTo(bytes);
+            if (bytes.size() > MAX_RESPONSE_BYTES) {
                 throw new IllegalStateException("INI response exceeds limit");
             }
 
-            SOAPMessage reply = parse(bytes);
             String outcome;
             HttpStatus responseStatus;
 
@@ -209,23 +210,40 @@ public class Iti42GuidedInjector {
 
                 String registryStatus = ((Element) responses.item(0)).getAttribute("status");
                 boolean success = "urn:oasis:names:tc:ebxml-regrep:ResponseStatusType:Success".equals(registryStatus);
-                outcome = success && status >= 200 && status < 300 ? "INI_SUCCESS" : "INI_REJECTED";
+                outcome = success && status != null && status >= 200 && status < 300 ? "INI_SUCCESS" : "INI_REJECTED";
                 responseStatus = "INI_SUCCESS".equals(outcome) ? HttpStatus.OK : HttpStatus.BAD_GATEWAY;
             }
 
             return response(responseStatus, new PublicationResponse(false, true, outcome,
                     request.destination().toString(), request.messageId(), request.assertionId(),
-                    status, new String(bytes, StandardCharsets.UTF_8)));
+                    status, bytes.toString(StandardCharsets.UTF_8)));
         } catch (Exception exception) {
+            // JAX-WS may wrap an exception thrown by a SOAP handler.
+            for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+                if (cause instanceof ShieldException rejection) {
+                    throw shieldRejection(rejection);
+                }
+            }
             return response(HttpStatus.BAD_GATEWAY, new PublicationResponse(false, transmissionStarted,
                     transmissionStarted ? "TRANSPORT_OR_RESPONSE_ERROR_DELIVERY_UNKNOWN" : "TRANSPORT_SETUP_ERROR",
                     request.destination().toString(), request.messageId(), request.assertionId(),
                     null, null));
         } finally {
-            if (connection != null) {
-                connection.disconnect();
+            if (dispatch instanceof java.io.Closeable closeable) {
+                try {
+                    closeable.close();
+                } catch (java.io.IOException ignored) {
+                    // Cleanup must not replace the registration outcome.
+                }
             }
         }
+    }
+
+    private ResponseStatusException shieldRejection(ShieldException exception) {
+        // The detailed Shield message can contain patient IDs; expose only the rule ID.
+        return new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
+                "Shield rejected ITI-42 request (" + exception.getFault().name()
+                        + "); no ITI-42 registration was transmitted");
     }
 
     private ResponseEntity<PublicationResponse> response(HttpStatus status, PublicationResponse body) {
@@ -249,6 +267,7 @@ public class Iti42GuidedInjector {
             @Schema(description = "MessageID WS-Addressing generato per questa costruzione.") String messageId,
             @Schema(description = "ID SAML generato per questa asserzione.") String assertionId,
             @Schema(description = "Stato HTTP restituito da INI, quando disponibile.") Integer upstreamHttpStatus,
-            @Schema(description = "XML della risposta INI, quando disponibile. Può contenere dati sensibili.") String upstreamSoapXml) {
+            @Schema(description = "XML della risposta INI serializzato da JAX-WS, quando disponibile; "
+                    + "per SOAP Fault può essere ricostruito dall'eccezione. Può contenere dati sensibili.") String upstreamSoapXml) {
     }
 }

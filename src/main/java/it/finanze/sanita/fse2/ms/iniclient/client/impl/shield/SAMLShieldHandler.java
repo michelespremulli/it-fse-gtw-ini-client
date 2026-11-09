@@ -60,9 +60,7 @@ public class SAMLShieldHandler implements SOAPHandler<SOAPMessageContext> {
         if (Boolean.TRUE.equals(outboundProperty)) {
         	SOAPPart document = smc.getMessage().getSOAPPart();
         	Long delta = new Date().getTime();
-            for (XDSFaultEnum fault : XDSFaultEnum.values()) {
-            	shieldAssertionEngine.evaluate(document, fault);
-            }
+            shieldAssertionEngine.validate(document);
             delta = new Date().getTime() - delta;
             log.info("SHIELD PROCESSING TIME (ms): {}", delta);
         }
