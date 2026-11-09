@@ -67,7 +67,6 @@ import org.opensaml.xml.signature.impl.KeyInfoBuilder;
 import org.opensaml.xml.signature.impl.SignatureBuilder;
 import org.opensaml.xml.signature.impl.X509CertificateBuilder;
 import org.opensaml.xml.signature.impl.X509DataBuilder;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
@@ -108,7 +107,6 @@ import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniClientCons
 
 /** CREATE-only ITI-42 construction, without JWT interpretation or metadata lookup. */
 @Component
-@ConditionalOnProperty(name = "ini.guided.enabled", havingValue = "true")
 public class Iti42SoapForge {
 
     // Protocol identifiers without an existing library or legacy constant.

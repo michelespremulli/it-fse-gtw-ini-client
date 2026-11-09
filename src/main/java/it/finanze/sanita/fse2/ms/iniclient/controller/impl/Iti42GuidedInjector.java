@@ -14,8 +14,10 @@ package it.finanze.sanita.fse2.ms.iniclient.controller.impl;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import javax.xml.namespace.QName;
 import javax.xml.soap.MessageFactory;
@@ -30,7 +32,7 @@ import javax.xml.ws.soap.SOAPFaultException;
 
 import com.sun.xml.ws.developer.JAXWSProperties;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import static it.finanze.sanita.fse2.ms.iniclient.enums.EventType.INI_CREATE_SOAP;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -38,6 +40,9 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PostMapping;
+import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.EVENT_DATE;
+import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.EVENT_TYPE;
+import static it.finanze.sanita.fse2.ms.iniclient.config.Constants.IniAudit.WII;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -53,16 +58,19 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
 import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.SAMLShieldHandler;
+import it.finanze.sanita.fse2.ms.iniclient.client.impl.SOAPLoggingHandler;
+
 import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.ShieldException;
 import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.ShieldAssertionEngine;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.ForgedIti42Request;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
+import it.finanze.sanita.fse2.ms.iniclient.service.IConfigSRV;
 import it.finanze.sanita.fse2.ms.iniclient.service.ISecuritySRV;
+import it.finanze.sanita.fse2.ms.iniclient.service.impl.AuditIniSrv;
 import it.finanze.sanita.fse2.ms.iniclient.service.impl.Iti42SoapForge;
 
 /** Internal ITI-42 endpoint; never uses workflow or mock orchestration. */
 @RestController
-@ConditionalOnProperty(name = "ini.guided.enabled", havingValue = "true")
 @RequestMapping("/internal/iti-42")
 @Tag(name = "Operazioni guidate ITI-42", description = "Solo CREATE, senza JWT o orchestrazione del workflow.")
 public class Iti42GuidedInjector {
@@ -74,12 +82,18 @@ public class Iti42GuidedInjector {
     private final GovwayCfg govway;
     private final ShieldAssertionEngine shield;
 
+    private final AuditIniSrv auditIniSrv;
+    private final IConfigSRV configSRV;
+
     public Iti42GuidedInjector(Iti42SoapForge forge, ISecuritySRV security, GovwayCfg govway,
-            ShieldAssertionEngine shield) {
+            ShieldAssertionEngine shield, AuditIniSrv auditIniSrv, IConfigSRV configSRV) {
+
         this.forge = forge;
         this.security = security;
         this.govway = govway;
         this.shield = shield;
+        this.auditIniSrv = auditIniSrv;
+        this.configSRV = configSRV;
     }
 
     @PostMapping(value = "/guided", consumes = "application/json")
@@ -146,6 +160,9 @@ public class Iti42GuidedInjector {
         Dispatch<SOAPMessage> dispatch = null;
         boolean transmissionStarted = false;
 
+        var startingDate = new Date();
+        var wii = "guided_" + UUID.randomUUID().toString();
+
         try {
             // No WSDL fetch, typed-body reconstruction, or WS-Addressing feature:
             // the Forge already supplied the complete envelope and its routing headers.
@@ -153,14 +170,23 @@ public class Iti42GuidedInjector {
             QName portName = new QName("urn:ihe:iti:xds-b:2007", "DocumentRegistry_Port_Soap12");
             Service service = Service.create(serviceName);
             service.addPort(portName, SOAPBinding.SOAP12HTTP_BINDING, request.destination().toString());
+
             dispatch = service.createDispatch(portName, SOAPMessage.class, Service.Mode.MESSAGE);
-            dispatch.getBinding().setHandlerChain(List.of(new SAMLShieldHandler(shield)));
+            dispatch.getBinding().setHandlerChain(List.of(new SAMLShieldHandler(shield),
+                        new SOAPLoggingHandler(auditIniSrv, configSRV)));
 
             var context = dispatch.getRequestContext();
+
+            // Insert loggins informationg
+            context.put(WII, wii);
+            context.put(EVENT_TYPE, INI_CREATE_SOAP);
+            context.put(EVENT_DATE, startingDate);
+
             context.put(BindingProvider.SOAPACTION_USE_PROPERTY, true);
             context.put(BindingProvider.SOAPACTION_URI_PROPERTY, request.action());
             context.put(JAXWSProperties.CONNECT_TIMEOUT, 10000);
             context.put(JAXWSProperties.REQUEST_TIMEOUT, 30000);
+
             // Streaming mode prevents HttpURLConnection from automatically replaying
             // the signed POST for a redirect or an authentication challenge.
             context.put(JAXWSProperties.HTTP_CLIENT_STREAMING_CHUNK_SIZE, 8192);
@@ -214,9 +240,10 @@ public class Iti42GuidedInjector {
                 responseStatus = "INI_SUCCESS".equals(outcome) ? HttpStatus.OK : HttpStatus.BAD_GATEWAY;
             }
 
-            return response(responseStatus, new PublicationResponse(false, true, outcome,
+            return response(responseStatus, new PublicationResponse(false, true, outcome, wii,
                     request.destination().toString(), request.messageId(), request.assertionId(),
                     status, bytes.toString(StandardCharsets.UTF_8)));
+
         } catch (Exception exception) {
             // JAX-WS may wrap an exception thrown by a SOAP handler.
             for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
@@ -226,7 +253,7 @@ public class Iti42GuidedInjector {
             }
             return response(HttpStatus.BAD_GATEWAY, new PublicationResponse(false, transmissionStarted,
                     transmissionStarted ? "TRANSPORT_OR_RESPONSE_ERROR_DELIVERY_UNKNOWN" : "TRANSPORT_SETUP_ERROR",
-                    request.destination().toString(), request.messageId(), request.assertionId(),
+                    wii, request.destination().toString(), request.messageId(), request.assertionId(),
                     null, null));
         } finally {
             if (dispatch instanceof java.io.Closeable closeable) {
@@ -263,6 +290,7 @@ public class Iti42GuidedInjector {
             @Schema(description = "Indica se è stata richiesta la sola anteprima.") boolean dryRun,
             @Schema(description = "Indica un tentativo di trasmissione, non la conferma di pubblicazione.") boolean sent,
             @Schema(description = "Esito locale o del registro.", example = "PREVIEW") String outcome,
+            @Schema(description = "Workflow Instance Id della transazione", example = "guided_2b101945-cfcc-4095-bea7-ff88f181f415") String workflowInstanceId,
             @Schema(description = "Destinazione configurata sul server.") String destination,
             @Schema(description = "MessageID WS-Addressing generato per questa costruzione.") String messageId,
             @Schema(description = "ID SAML generato per questa asserzione.") String assertionId,

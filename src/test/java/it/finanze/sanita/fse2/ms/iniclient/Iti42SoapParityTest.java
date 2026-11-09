@@ -53,6 +53,8 @@ import it.finanze.sanita.fse2.ms.iniclient.client.impl.shield.assertions.ShieldA
 import it.finanze.sanita.fse2.ms.iniclient.config.GovwayCfg;
 import it.finanze.sanita.fse2.ms.iniclient.controller.impl.Iti42GuidedInjector;
 import it.finanze.sanita.fse2.ms.iniclient.service.ISecuritySRV;
+import it.finanze.sanita.fse2.ms.iniclient.service.IConfigSRV;
+import it.finanze.sanita.fse2.ms.iniclient.service.impl.AuditIniSrv;
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
 import it.finanze.sanita.fse2.ms.iniclient.dto.*;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
@@ -194,7 +196,8 @@ class Iti42SoapParityTest {
             var govway = new GovwayCfg();
             govway.setGovwayUser("test-user");
             govway.setGovwayPass("test-password");
-            var injector = new Iti42GuidedInjector(preparedForge, security, govway, shield);
+            var injector = new Iti42GuidedInjector(preparedForge, security, govway, shield,
+                    mock(AuditIniSrv.class), mock(IConfigSRV.class));
 
             var response = injector.publish(json.convertValue(fields, GuidedPublicationRequest.class), false);
             assertEquals(200, response.getStatusCode().value());
