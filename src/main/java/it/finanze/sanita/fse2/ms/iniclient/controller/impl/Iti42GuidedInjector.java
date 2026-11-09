@@ -56,7 +56,7 @@ import it.finanze.sanita.fse2.ms.iniclient.service.impl.Iti42SoapForge;
 @RestController
 @ConditionalOnProperty(name = "ini.guided.enabled", havingValue = "true")
 @RequestMapping("/internal/iti-42")
-@Tag(name = "Operazioni guidate ITI-42", description = "CREATE, REPLACE e UPDATE v1, senza JWT o orchestrazione del workflow.")
+@Tag(name = "Operazioni guidate ITI-42", description = "Solo CREATE, senza JWT o orchestrazione del workflow.")
 public class Iti42GuidedInjector {
 
     private static final int MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -72,20 +72,15 @@ public class Iti42GuidedInjector {
     }
 
     @PostMapping(value = "/guided", consumes = "application/json")
-    @Operation(summary = "Costruisce SOAP ITI-42 CREATE, REPLACE o UPDATE v1 con SAML firmato", description = """
+    @Operation(summary = "Costruisce SOAP ITI-42 CREATE con SAML firmato", description = """
             Con dryRun=true restituisce direttamente i byte XML (application/soap+xml), senza involucro JSON,
             escape JSON o riformattazione. Con dryRun=false restituisce l'esito JSON e invia i byte SOAP
             alla destinazione configurata sul server. Gli ID tecnici e IssueInstant sono generati;
-            Il parametro query action accetta CREATE (predefinito), REPLACE o UPDATE.
-            Tutti usano RegisterDocumentSet-b e la destinazione registry v1, non ITI-57.
-            L'action-id SAML è CREATE per CREATE/REPLACE, UPDATE per UPDATE.
-            REPLACE richiede RPLC.targetObject; UPDATE richiede XDSDocumentEntry.uniqueId.
-            UPDATE legge INI anche in dry-run, seleziona il primo documento Approved e modifica solo classificazioni e slot previsti dal merge legacy.
-            Conserva gli altri metadati, lid e VersionInfo; null rimuove i metadati oggetto del merge, non significa conservarli.
-            I campi specifici di un'altra operazione sono ignorati. SubmissionSetStatus=Original è costante.
+            Supporta solo CREATE, con RegisterDocumentSet-b e la destinazione registry v1.
+            L'action-id SAML è sempre CREATE. Non esegue letture INI.
+            SubmissionSetStatus=Original è costante.
             Parametri piatti orientati alle destinazioni SOAP, senza gruppi CSV/JWT.
-            CREATE/REPLACE hanno pazienti, autori, applicazioni, SourceId e MIME espliciti e indipendenti.
-            UPDATE deriva SourceId da organization-id e patientId della sottomissione da resource-id; copia l'autore del documento.
+            Pazienti, autori, applicazioni, SourceId e MIME sono espliciti e indipendenti.
             submissionTime è generato a runtime per tutte le operazioni, nel formato yyyyMMddHHmmss e fuso orario del server.
             Tempi SAML, contesto X509 e autenticatore seguono i builder esistenti.
             Non verifica conformità INI.
@@ -101,29 +96,16 @@ public class Iti42GuidedInjector {
                     @Content(mediaType = "application/soap+xml", schema = @Schema(type = "string")),
                     @Content(mediaType = "application/json", schema = @Schema(implementation = PublicationResponse.class))
             })
-    @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri non validi; action supporta CREATE, REPLACE e UPDATE. "
-            + "Riferimento obbligatorio per REPLACE/UPDATE mancante.")
-    @ApiResponse(responseCode = "500", description = "Lettura INI, costruzione o firma fallita; nessun aggiornamento ITI-42 trasmesso.")
+    @ApiResponse(responseCode = "400", description = "Richiesta JSON o parametri non validi.")
+    @ApiResponse(responseCode = "500", description = "Costruzione o firma fallita; nessuna registrazione ITI-42 trasmessa.")
     @ApiResponse(responseCode = "502", description = "Errore di trasporto, SOAP Fault o rifiuto del registro. "
             + "Dopo un tentativo di trasmissione la consegna può essere incerta: non ripetere automaticamente.")
     public ResponseEntity<?> publish(
             @RequestBody GuidedPublicationRequest input,
-            @Parameter(description = "Operazione ITI-42: CREATE (predefinito), REPLACE o UPDATE v1. Non è l'action-id SAML.",
-                    schema = @Schema(allowableValues = {"CREATE", "REPLACE", "UPDATE"}, defaultValue = "CREATE"))
-            @RequestParam(name = "action", defaultValue = "CREATE") String action,
-            @Parameter(description = "true (predefinito): anteprima senza invio ITI-42; UPDATE esegue comunque la lettura INI. "
+            @Parameter(description = "true (predefinito): anteprima senza chiamate INI. "
                     + "false: invio effettivo a INI.") @RequestParam(defaultValue = "true") boolean dryRun) {
         try {
-            if (!"CREATE".equals(action) && !"REPLACE".equals(action) && !"UPDATE".equals(action)) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Supported ITI-42 actions: CREATE, REPLACE, UPDATE");
-            }
-            if ("REPLACE".equals(action) && (input.replacementTarget() == null || input.replacementTarget().isBlank())) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "REPLACE requires RPLC.targetObject");
-            }
-            if ("UPDATE".equals(action) && (input.documentUniqueId() == null || input.documentUniqueId().isBlank())) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "UPDATE requires XDSDocumentEntry.uniqueId");
-            }
-            ForgedIti42Request request = forge.forge(input, action);
+            ForgedIti42Request request = forge.forge(input);
 
             // A future read-only Shield inspects request here, including the completed message.
             // Serialize that same instance once; do not rebuild or format XML after inspection.

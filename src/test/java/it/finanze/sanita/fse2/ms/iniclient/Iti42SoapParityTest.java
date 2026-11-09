@@ -12,7 +12,6 @@
 package it.finanze.sanita.fse2.ms.iniclient;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import java.io.ByteArrayInputStream;
@@ -39,15 +38,12 @@ import javax.xml.soap.SOAPMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
 import org.opensaml.xml.security.x509.BasicX509Credential;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import it.finanze.sanita.fse2.ms.iniclient.client.IIniClient;
 import it.finanze.sanita.fse2.ms.iniclient.config.IniCFG;
 import it.finanze.sanita.fse2.ms.iniclient.dto.*;
 import it.finanze.sanita.fse2.ms.iniclient.dto.iti42.GuidedPublicationRequest;
@@ -56,30 +52,25 @@ import it.finanze.sanita.fse2.ms.iniclient.service.impl.Iti42SoapForge;
 import it.finanze.sanita.fse2.ms.iniclient.singleton.SigningCredentialSingleton;
 import it.finanze.sanita.fse2.ms.iniclient.utility.common.SamlHeaderBuilderUtility;
 import it.finanze.sanita.fse2.ms.iniclient.utility.create.PublishReplaceBodyBuilderUtility;
-import it.finanze.sanita.fse2.ms.iniclient.utility.update.UpdateBodyBuilderUtility;
 import oasis.names.tc.ebxml_regrep.xsd.lcm._3.SubmitObjectsRequest;
-import oasis.names.tc.ebxml_regrep.xsd.query._3.AdhocQueryResponse;
-import oasis.names.tc.ebxml_regrep.xsd.rim._3.*;
 
 /**
  * Offline comparison of the real legacy header/body builders with the public forge.
- * This checks SOAP payloads, not JAX-WS HTTP framing or INI conformance. The metadata
- * lookup is mocked; neither side can contact INI. Only the credential provider is
+ * This checks SOAP payloads, not JAX-WS HTTP framing or INI conformance. The
+ * forge has no lookup dependency; neither side can contact INI. Only the credential provider is
  * stubbed, using the repository's test key, without changing its singleton cache.
  */
-@DisplayName("Offline SOAP parity: forge matches the legacy ITI-42 builders")
+@DisplayName("Offline SOAP parity: CREATE forge matches the legacy ITI-42 builders")
 class Iti42SoapParityTest {
     private static final String SAML = "urn:oasis:names:tc:SAML:2.0:assertion";
     private static final String WSA = "http://www.w3.org/2005/08/addressing";
     private static final String RIM = "urn:oasis:names:tc:ebxml-regrep:xsd:rim:3.0";
     private static final String PATIENT = "RSSMRA80A01H501U^^^&2.16.840.1.113883.2.9.4.3.2&ISO";
     private static final String SUBJECT = "BNCLGU75B15F205X^^^&2.16.840.1.113883.2.9.4.3.2&ISO";
-    private static final String TARGET = "urn:uuid:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     private static final String UNIQUE_ID = "2.16.840.1.113883.2.9.950.1234";
     private static final String SUBMISSION_TIME = "20261108120000";
 
     private final ObjectMapper json = new ObjectMapper();
-    private final IIniClient lookup = mock(IIniClient.class);
     private final IniCFG config = new IniCFG();
     private Iti42SoapForge forge;
     private SamlHeaderBuilderUtility legacyHeaders;
@@ -88,7 +79,7 @@ class Iti42SoapParityTest {
     @BeforeEach
     void setUp() throws Exception {
         config.setUrlWsdlDocumentRegistryService("https://example.invalid/registry");
-        forge = new Iti42SoapForge(config, lookup);
+        forge = new Iti42SoapForge(config);
 
         legacyHeaders = new SamlHeaderBuilderUtility();
         ReflectionTestUtils.setField(legacyHeaders, "iniCFG", config);
@@ -111,10 +102,9 @@ class Iti42SoapParityTest {
         credential.setEntityCertificate((X509Certificate) store.getCertificate(alias));
     }
 
-    @DisplayName("CREATE and REPLACE produce comparable signed SOAP without contacting INI")
-    @ParameterizedTest(name = "{0}: forge matches the legacy publication builders")
-    @EnumSource(value = ActionEnumType.class, names = {"CREATE", "REPLACE"})
-    void publicationAndReplacementMatchLegacy(ActionEnumType operation) throws Exception {
+    @Test
+    @DisplayName("CREATE produces comparable signed SOAP without contacting INI")
+    void publicationMatchesLegacy() throws Exception {
         var input = input();
         var document = document();
 
@@ -123,95 +113,24 @@ class Iti42SoapParityTest {
                 "Submission institution", PATIENT);
 
         var body = PublishReplaceBodyBuilderUtility.buildSubmitObjectRequest(document, submission,
-                token(operation).getPayload(), operation == ActionEnumType.REPLACE ? TARGET : null);
+                token(ActionEnumType.CREATE).getPayload(), null);
 
         // Run both real builders with the same signing credential.
         try (var signing = mockStatic(SigningCredentialSingleton.class)) {
             signing.when(() -> SigningCredentialSingleton.getInstance(config)).thenReturn(credential);
-            var legacy = legacySoap(body, operation);
-            var actual = forge.forge(input, operation.name());
+            var legacy = legacySoap(body, ActionEnumType.CREATE);
+            var actual = forge.forge(input);
 
             assertEquals(config.getUrlWsdlDocumentRegistryService(), actual.destination().toString());
             assertComparable(legacy, actual.message());
+
+            // CREATE registers one membership association, never a replacement link.
+            var xml = serialized(actual.message());
+            assertEquals(1, xml.getElementsByTagNameNS(RIM, "Association").getLength());
+            var association = (Element) xml.getElementsByTagNameNS(RIM, "Association").item(0);
+            assertEquals("urn:oasis:names:tc:ebxml-regrep:AssociationType:HasMember",
+                    association.getAttribute("associationType"));
         }
-
-        verifyNoInteractions(lookup);
-    }
-
-    enum UpdateCase { POPULATED, DUPLICATE_EVENTS, NULL_OPTIONAL_VALUES, EMPTY_ADMINISTRATIVE_REQUESTS, NO_LID, NO_AUTHOR }
-
-    @DisplayName("UPDATE preserves legacy merge behavior and produces comparable signed SOAP")
-    @ParameterizedTest(name = "{0}: forge matches the legacy UPDATE merge")
-    @EnumSource(UpdateCase.class)
-    void updateMatchesLegacyMerge(UpdateCase scenario) throws Exception {
-        var fields = inputFields();
-
-        // Equivalent legacy input: enums and DTO fields instead of guided JSON fields.
-        var metadata = new PublicationMetadataReqDTO();
-        metadata.setTipologiaStruttura(HealthcareFacilityEnum.Ospedale);
-        metadata.setTipoDocumentoLivAlto(TipoDocAltoLivEnum.REF);
-        metadata.setAssettoOrganizzativo(PracticeSettingCodeEnum.AD_PSC001);
-        metadata.setTipoAttivitaClinica(AttivitaClinicaEnum.CON);
-        metadata.setIdentificativoSottomissione("2.16.840.1.113883.2.9.950.5678");
-        metadata.setAttiCliniciRegoleAccesso(List.of("J07AC", "J07AD"));
-        metadata.setDataInizioPrestazione("20261108090000");
-        metadata.setDataFinePrestazione("20261108100000");
-        metadata.setDescriptions(List.of("First description", "Ignored second description"));
-        metadata.setAdministrativeRequest(List.of(AdministrativeReqEnum.SSN));
-        fields.put("urn:ita:2022:description", metadata.getDescriptions());
-
-        // Apply the same scenario to both input formats.
-        if (scenario == UpdateCase.DUPLICATE_EVENTS) {
-            metadata.setAttiCliniciRegoleAccesso(List.of("J07AC", "J07AD", "J07AC"));
-            fields.put("XDSDocumentEntry.eventCodeList", List.of(code("J07AC", "Anthrax vaccines"),
-                    code("J07AD", "Brucellosis vaccines"), code("J07AC", "Anthrax vaccines")));
-        }
-
-        if (scenario == UpdateCase.NULL_OPTIONAL_VALUES) {
-            metadata.setDataInizioPrestazione(null);
-            metadata.setDataFinePrestazione(null);
-            metadata.setDescriptions(null);
-            metadata.setAdministrativeRequest(null);
-            for (String key : List.of("XDSDocumentEntry.serviceStartTime", "XDSDocumentEntry.serviceStopTime",
-                    "urn:ita:2022:description", "urn:ita:2022:administrativeRequest")) fields.remove(key);
-        }
-
-        if (scenario == UpdateCase.EMPTY_ADMINISTRATIVE_REQUESTS) {
-            metadata.setAdministrativeRequest(List.of());
-            fields.put("urn:ita:2022:administrativeRequest", List.of());
-        }
-
-        // Separate object graphs: both implementations mutate the metadata they receive.
-        var legacyExisting = existing(scenario);
-        var forgeExisting = existing(scenario);
-
-        var old = new RegistryObjectListType();
-        old.getIdentifiable().add(new ObjectFactory().createExtrinsicObject(legacyExisting));
-
-        // Stub only the INI lookup; the forge still performs its real merge and signing.
-        var response = new AdhocQueryResponse();
-        response.setRegistryObjectList(new RegistryObjectListType());
-        response.getRegistryObjectList().getIdentifiable().add(new ObjectFactory().createExtrinsicObject(forgeExisting));
-        when(lookup.getReferenceMetadata(eq(UNIQUE_ID), eq(SearchTypeEnum.LEAF_CLASS.getSearchKey()),
-                any(JWTTokenDTO.class), eq(ActionEnumType.READ_METADATA), anyString(), any()))
-                .thenReturn(response);
-
-        String lid = legacyExisting.getLid() == null ? legacyExisting.getId() : legacyExisting.getLid();
-        var body = UpdateBodyBuilderUtility.buildSubmitObjectRequest(old,
-                new MergedMetadatiRequestDTO(UNIQUE_ID, token(ActionEnumType.UPDATE).getPayload(), metadata, "workflow"),
-                lid, token(ActionEnumType.UPDATE), UNIQUE_ID);
-
-        try (var signing = mockStatic(SigningCredentialSingleton.class)) {
-            signing.when(() -> SigningCredentialSingleton.getInstance(config)).thenReturn(credential);
-            var legacy = legacySoap(body, ActionEnumType.UPDATE);
-            var actual = forge.forge(json.convertValue(fields, GuidedPublicationRequest.class), "UPDATE");
-
-            assertComparable(legacy, actual.message());
-        }
-
-        verify(lookup).getReferenceMetadata(eq(UNIQUE_ID), eq(SearchTypeEnum.LEAF_CLASS.getSearchKey()),
-                any(JWTTokenDTO.class), eq(ActionEnumType.READ_METADATA), anyString(), any());
-        verifyNoMoreInteractions(lookup);
     }
 
     private SOAPMessage legacySoap(SubmitObjectsRequest body, ActionEnumType operation) throws Exception {
@@ -277,7 +196,7 @@ class Iti42SoapParityTest {
         fields.put("XDSDocumentEntry.author.authorRole", "APR");
         fields.put("XDSDocumentEntry.author.authorInstitution", "Document institution");
 
-        // Submission metadata is independent for CREATE/REPLACE, derived for UPDATE.
+        // Submission metadata is independent from the document and SAML context.
         fields.put("XDSSubmissionSet.sourceId", "2.16.840.1.113883.2.9.950");
         fields.put("XDSSubmissionSet.uniqueId", "2.16.840.1.113883.2.9.950.5678");
         fields.put("XDSSubmissionSet.patientId", PATIENT);
@@ -286,7 +205,6 @@ class Iti42SoapParityTest {
         fields.put("XDSSubmissionSet.author.authorRole", "APR");
         fields.put("XDSSubmissionSet.author.authorInstitution", "Submission institution");
 
-        fields.put("urn:ihe:iti:2007:AssociationType:RPLC.targetObject", TARGET);
         return fields;
     }
 
@@ -306,41 +224,6 @@ class Iti42SoapParityTest {
         d.setPracticeSettingCode("AD_PSC001"); d.setPracticeSettingCodeName("Allergologia");
         d.setTypeCode("11502-2"); d.setTypeCodeName("Laboratory report"); d.setEventCodeList(List.of("J07AC", "J07AD"));
         d.setAuthor("Document author"); d.setAuthorRole("APR"); d.setAuthorInstitution("Document institution");
-        return d;
-    }
-
-    private ExtrinsicObjectType existing(UpdateCase scenario) {
-        var body = PublishReplaceBodyBuilderUtility.buildSubmitObjectRequest(document(), new SubmissionSetEntryDTO(),
-                token(ActionEnumType.UPDATE).getPayload(), null);
-        var d = (ExtrinsicObjectType) body.getRegistryObjectList().getIdentifiable().getFirst().getValue();
-
-        d.setId(TARGET); d.setLid(scenario == UpdateCase.NO_LID ? null : "urn:uuid:bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee");
-        var version = new VersionInfoType(); version.setVersionName("3"); d.setVersionInfo(version);
-
-        // Give merged fields old values: comparing two unchanged snapshots would not
-        // catch a regression that accidentally stops applying the requested changes.
-        for (var classification : d.getClassification()) {
-            if (List.of(ClassificationEnum.CLASS_CODE, ClassificationEnum.HEALTH_CARE_FACILITY_TYPE_CODE,
-                    ClassificationEnum.PRACTICE_SETTING_CODE, ClassificationEnum.EVENT_CODE).stream()
-                    .anyMatch(category -> category.getClassificationScheme().equals(classification.getClassificationScheme()))) {
-                classification.setNodeRepresentation("old-code");
-                classification.getName().getLocalizedString().getFirst().setValue("Old display name");
-            }
-        }
-
-        for (var existingSlot : d.getSlot()) {
-            if (List.of("serviceStartTime", "serviceStopTime", "urn:ita:2022:description",
-                    "urn:ita:2022:administrativeRequest").contains(existingSlot.getName())) {
-                existingSlot.getValueList().getValue().clear();
-                existingSlot.getValueList().getValue().add("old-value");
-            }
-        }
-
-        if (scenario == UpdateCase.NO_AUTHOR) d.getClassification().removeIf(c -> ClassificationEnum.AUTHOR.getClassificationScheme().equals(c.getClassificationScheme()));
-
-        // Unknown metadata must survive the merge, rather than being silently rebuilt away.
-        var slot = new SlotType1(); slot.setName("custom-preserved-slot"); slot.setValueList(new ValueListType());
-        slot.getValueList().getValue().add("preserved value"); d.getSlot().add(slot);
         return d;
     }
 
