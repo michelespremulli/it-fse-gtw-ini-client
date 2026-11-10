@@ -302,7 +302,8 @@ public class Iti42SoapForge {
         populate(submission, SUBMISSION_ENTRY_ID, null, REGISTRY_PACKAGE_OBJECT_TYPE);
 
         // Same format and default timezone as the legacy publication path.
-        addSlot(submission, "submissionTime", new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()));
+        addSlot(submission, "submissionTime", input.submissionTime() == null || input.submissionTime().isBlank()
+                ? new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()) : input.submissionTime());
         coded(submission, SUBMISSION_CONTENT_TYPE_SCHEME,
                 SUBMISSION_CONTENT_TYPE_CODING_SCHEME, submissionInput.contentTypeCode(), "IdContentTypeCode");
         author(submission, SUBMISSION_AUTHOR_SCHEME, input.submissionAuthorPerson(),

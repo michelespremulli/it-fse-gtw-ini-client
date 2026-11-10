@@ -199,11 +199,14 @@ class Iti42SoapParityTest {
             var injector = new Iti42GuidedInjector(preparedForge, security, govway, shield,
                     mock(AuditIniSrv.class), mock(IConfigSRV.class));
 
-            var response = injector.publish(json.convertValue(fields, GuidedPublicationRequest.class), false);
-            assertEquals(200, response.getStatusCode().value());
-            var outcome = (Iti42GuidedInjector.PublicationResponse) response.getBody();
-            assertEquals("INI_SUCCESS", outcome.outcome());
-            assertEquals(200, outcome.upstreamHttpStatus());
+            var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(injector).build();
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .post("/internal/iti-42/guided").param("dryRun", "false")
+                            .contentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED)
+                            .params(GuidedTestParameters.valid()))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk())
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.outcome").value("INI_SUCCESS"))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.upstreamHttpStatus").value(200));
             verify(shield).validate(any()); // Executed by the real outbound JAX-WS handler.
             verifyNoInteractions(security); // Loopback HTTP only.
 

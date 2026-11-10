@@ -30,6 +30,134 @@ import io.swagger.v3.oas.models.servers.Server;
 @Configuration
 public class OpenApiCFG {
 
+    /** Springdoc represents form fields as request-body properties, not operation parameters. */
+    @Bean
+    public OpenApiCustomizer guidedFormExamples() {
+        return openApi -> {
+            if (openApi.getPaths() == null) return;
+            var path = openApi.getPaths().get("/internal/iti-42/guided");
+            if (path == null || path.getPost() == null) return;
+            var body = path.getPost().getRequestBody();
+            if (body == null || body.getContent() == null) return;
+            var media = body.getContent().get("application/x-www-form-urlencoded");
+            if (media == null || media.getSchema() == null) return;
+            var form = media.getSchema();
+            if (form.get$ref() != null && openApi.getComponents() != null) {
+                String name = form.get$ref().substring(form.get$ref().lastIndexOf('/') + 1);
+                form = openApi.getComponents().getSchemas().get(name);
+            }
+            if (form == null) return;
+
+            var method = java.util.Arrays.stream(
+                    it.finanze.sanita.fse2.ms.iniclient.controller.impl.Iti42GuidedInjector.class.getDeclaredMethods())
+                    .filter(candidate -> candidate.getName().equals("publish")).findFirst().orElseThrow();
+            for (var field : method.getParameters()) {
+                var request = field.getAnnotation(org.springframework.web.bind.annotation.RequestParam.class);
+                var documentation = field.getAnnotation(io.swagger.v3.oas.annotations.Parameter.class);
+                if (request == null || documentation == null) continue;
+                String name = request.name().isEmpty() ? field.getName() : request.name();
+                boolean list = java.util.List.class.isAssignableFrom(field.getType());
+                boolean optional = !request.required();
+                var property = form.getProperties() == null ? null
+                        : (io.swagger.v3.oas.models.media.Schema<?>) form.getProperties().get(name);
+                if (property == null) {
+                    if (list) property = new io.swagger.v3.oas.models.media.ArraySchema()
+                            .items(new io.swagger.v3.oas.models.media.StringSchema());
+                    else if (field.getType() == Boolean.class || field.getType() == boolean.class)
+                        property = new io.swagger.v3.oas.models.media.BooleanSchema();
+                    else if (field.getType() == Long.class)
+                        property = new io.swagger.v3.oas.models.media.IntegerSchema().format("int64");
+                    else property = new io.swagger.v3.oas.models.media.StringSchema();
+                    form.addProperty(name, property);
+                }
+                Object example;
+                try {
+                    if (optional) example = list ? java.util.List.of() : "";
+                    else if (list) example = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(documentation.example(), java.util.List.class);
+                    else if (field.getType() == Boolean.class || field.getType() == boolean.class)
+                        example = Boolean.valueOf(documentation.example());
+                    else if (field.getType() == Long.class) example = Long.valueOf(documentation.example());
+                    else example = documentation.example();
+                } catch (com.fasterxml.jackson.core.JsonProcessingException exception) {
+                    throw new IllegalStateException("Invalid guided documentation example: " + name, exception);
+                }
+                property.setDescription(documentation.description() + (optional
+                        ? " Esempio di formato: " + documentation.example() + ". Vuoto: omesso dal SOAP." : ""));
+                property.setExample(example);
+                // Swagger UI form controls use schema defaults, not always schema examples.
+                // These are editable UI prefills only: @RequestParam has no business-data default.
+                setDocumentationDefault(property, example);
+                var allowed = it.finanze.sanita.fse2.ms.iniclient.enums.guided.GuidedChoices.allowed(name);
+                if (!allowed.isEmpty()) {
+                    var selection = new io.swagger.v3.oas.models.media.StringSchema();
+                    selection.setEnum(allowed);
+                    if (list) {
+                        property.setItems(selection);
+                        media.addEncoding(name, new io.swagger.v3.oas.models.media.Encoding()
+                                .style(io.swagger.v3.oas.models.media.Encoding.StyleEnum.FORM).explode(true));
+                    } else {
+                        setDocumentationEnum(property, allowed);
+                    }
+                }
+            }
+        };
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void setDocumentationDefault(io.swagger.v3.oas.models.media.Schema schema, Object value) {
+        schema.setDefault(value);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void setDocumentationEnum(io.swagger.v3.oas.models.media.Schema schema, List<String> values) {
+        schema.setEnum(values);
+    }
+
+    @Bean
+    public OpenApiCustomizer readableGuidedChoices() {
+        return openApi -> {
+            if (openApi.getPaths() == null) return;
+            var path = openApi.getPaths().get("/internal/iti-42/guided");
+            if (path == null || path.getPost() == null || path.getPost().getParameters() == null) return;
+            for (var parameter : path.getPost().getParameters()) {
+                var allowed = it.finanze.sanita.fse2.ms.iniclient.enums.guided.GuidedChoices.allowed(parameter.getName());
+                if (allowed.isEmpty()) continue;
+                var selection = new io.swagger.v3.oas.models.media.StringSchema();
+                selection.setEnum(allowed);
+                if (java.util.Set.of("eventCodes", "administrativeRequests").contains(parameter.getName())) {
+                    parameter.setSchema(new io.swagger.v3.oas.models.media.ArraySchema().items(selection));
+                    parameter.setExplode(true);
+                } else {
+                    parameter.setSchema(selection);
+                }
+            }
+        };
+    }
+
+    @Bean
+    public OpenApiCustomizer emptyGuidedOptionalParameters() {
+        return openApi -> {
+            if (openApi.getPaths() == null) return;
+            var path = openApi.getPaths().get("/internal/iti-42/guided");
+            if (path == null || path.getPost() == null || path.getPost().getParameters() == null) return;
+            // Explicit model examples suppress Swagger UI's generated "string" placeholder.
+            // Keep the useful nonempty examples in the descriptions, not prefilled controls.
+            for (var parameter : path.getPost().getParameters()) {
+                if (!java.util.Set.of("title", "serviceStartTime", "serviceStopTime", "submissionTime", "conservazioneANorma",
+                        "descriptions", "referenceIds").contains(parameter.getName())) continue;
+                Object empty = parameter.getSchema() instanceof io.swagger.v3.oas.models.media.ArraySchema
+                        ? java.util.List.of() : "";
+                parameter.setDescription(parameter.getDescription() + " Esempio di formato: "
+                        + parameter.getExample() + ". Predefinito vuoto: nessun valore SOAP.");
+                parameter.setExample(empty);
+                if (parameter.getSchema() != null) {
+                    parameter.getSchema().setExample(empty);
+                }
+            }
+        };
+    }
+
     @Autowired
 	private CustomSwaggerCFG customOpenapi;
 

@@ -6,7 +6,8 @@ import java.util.List;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.swagger.v3.oas.annotations.media.Schema;
 
-@Schema(description = "Proprietà JSON allineate al SOAP: URN degli attributi SAML e nomi XDS qualificati. "
+@Schema(description = "Contratto interno Forge, non un request body HTTP. "
+        + "Proprietà allineate al SOAP: URN degli attributi SAML e nomi XDS qualificati. "
         + "I punti nei nomi sono letterali, non oggetti annidati. I valori Header e Body sono indipendenti. "
         + "Supporta solo CREATE: nessuna lettura o modifica di documenti INI esistenti. "
         + "Costanti e ID tecnici sono interni; nessuna validazione di conformità INI. "
@@ -132,7 +133,10 @@ public record GuidedPublicationRequest(
                 example = "2.16.840.1.113883.2.9.2.950.4.4.202611060002") String submissionUniqueId,
         @JsonProperty("XDSSubmissionSet.contentTypeCode")
         @Schema(description = "Codice e nome espliciti dell'attività clinica; nessun lookup da enum.",
-                example = "{\"nodeRepresentation\":\"CON\",\"rim:Name\":\"Consulto\"}") Code contentTypeCode) {
+                example = "{\"nodeRepresentation\":\"CON\",\"rim:Name\":\"Consulto\"}") Code contentTypeCode,
+        @JsonProperty("XDSSubmissionSet.submissionTime")
+        @Schema(description = "Data sottomissione opzionale yyyyMMddHHmmss; se assente è generata dal server.",
+                example = "20261108110000") String submissionTime) {
 
     public record Code(
             @JsonProperty("nodeRepresentation")
